@@ -1,9 +1,9 @@
 /**
  * 大学院研究進捗管理Webアプリ — メインアプリケーション
- * MASTER_SPEC.md に基づく認証・初回PW変更強制・兼務ユーザーの学生/管理者画面切替・権限制御を統括
+ * MASTER_SPEC.md に基づく認証・初回PW変更強制・兼務ユーザーの学生/管理者画面切替・年度別管理・権限制御を統括
  */
 
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   ArrowLeftRight,
   GraduationCap,
@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import type {
   AcademicEvent,
+  AcademicYear,
   AuditLog,
   EnrollmentStatus,
   MasterGrade,
@@ -27,9 +28,12 @@ import {
 } from './data/roadmapSeed';
 import {
   buildInitialDemoProgress,
-  DEMO_USERS,
+  INITIAL_ACADEMIC_YEARS,
   INITIAL_AUDIT_LOGS,
   INITIAL_STUDENTS,
+  INITIAL_USERS,
+  sha256Hex,
+  type StoredAccount,
 } from './data/demoSeed';
 import {
   calculateCommonDueDate,
@@ -44,28 +48,110 @@ import {
 import { StudentDashboard } from './features/student/StudentDashboard';
 import { AdminDashboard } from './features/admin/AdminDashboard';
 
+const STORAGE_KEYS = {
+  users: 'shintyokukanri_v1_users',
+  students: 'shintyokukanri_v1_students',
+  academicYears: 'shintyokukanri_v1_academic_years',
+  selectedYear: 'shintyokukanri_v1_selected_year',
+  progress: 'shintyokukanri_v1_progress',
+  audit: 'shintyokukanri_v1_audit',
+};
+
+function loadPersisted<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
 export const App: React.FC = () => {
   const todayTokyo = useMemo(() => getTokyoDateString(), []);
 
-  // アカウント・マスター・進捗ステート
-  const [usersMap, setUsersMap] = useState(() => ({ ...DEMO_USERS }));
+  // アカウント・マスター・年度別設定・進捗ステート（ブラウザリロード時も保持）
+  const [usersMap, setUsersMap] = useState<Record<string, StoredAccount>>(() =>
+    loadPersisted(STORAGE_KEYS.users, { ...INITIAL_USERS })
+  );
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
   const [activeViewMode, setActiveViewMode] = useState<'STUDENT' | 'ADMIN'>(
     'STUDENT'
   );
 
-  const [students, setStudents] = useState<Student[]>(() => [
-    ...INITIAL_STUDENTS,
-  ]);
-  const [academicEvents, setAcademicEvents] = useState<AcademicEvent[]>(() => [
-    ...DEFAULT_ACADEMIC_EVENTS_2026,
-  ]);
-  const [progressRecords, setProgressRecords] = useState<ProgressRecord[]>(() =>
-    buildInitialDemoProgress()
+  const [students, setStudents] = useState<Student[]>(() =>
+    loadPersisted(STORAGE_KEYS.students, [...INITIAL_STUDENTS])
   );
-  const [auditLogs, setAuditLogs] = useState<AuditLog[]>(() => [
-    ...INITIAL_AUDIT_LOGS,
-  ]);
+  const [academicYearsMap, setAcademicYearsMap] = useState<
+    Record<number, AcademicYear>
+  >(() => loadPersisted(STORAGE_KEYS.academicYears, { ...INITIAL_ACADEMIC_YEARS }));
+  const [selectedAcademicYear, setSelectedAcademicYear] = useState<number>(() =>
+    loadPersisted(STORAGE_KEYS.selectedYear, 2026)
+  );
+  const [progressRecords, setProgressRecords] = useState<ProgressRecord[]>(() =>
+    loadPersisted(STORAGE_KEYS.progress, buildInitialDemoProgress())
+  );
+  const [auditLogs, setAuditLogs] = useState<AuditLog[]>(() =>
+    loadPersisted(STORAGE_KEYS.audit, [...INITIAL_AUDIT_LOGS])
+  );
+
+  // 変更時に自動保存
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEYS.users, JSON.stringify(usersMap));
+    } catch {
+      // ignore storage quota errors
+    }
+  }, [usersMap]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEYS.students, JSON.stringify(students));
+    } catch {
+      // ignore
+    }
+  }, [students]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        STORAGE_KEYS.academicYears,
+        JSON.stringify(academicYearsMap)
+      );
+    } catch {
+      // ignore
+    }
+  }, [academicYearsMap]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        STORAGE_KEYS.selectedYear,
+        JSON.stringify(selectedAcademicYear)
+      );
+    } catch {
+      // ignore
+    }
+  }, [selectedAcademicYear]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        STORAGE_KEYS.progress,
+        JSON.stringify(progressRecords)
+      );
+    } catch {
+      // ignore
+    }
+  }, [progressRecords]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEYS.audit, JSON.stringify(auditLogs));
+    } catch {
+      // ignore
+    }
+  }, [auditLogs]);
 
   const userProfilesList = useMemo(
     () => Object.values(usersMap).map((u) => u.profile),
@@ -79,7 +165,9 @@ export const App: React.FC = () => {
   ): Promise<string | null> => {
     const key = email.toLowerCase();
     const matched = usersMap[key];
-    if (!matched || matched.password !== password) {
+    const inputHash = await sha256Hex(password);
+
+    if (!matched || matched.passwordHash !== inputHash) {
       return 'メールアドレスまたはパスワードが正しくありません。';
     }
     if (!matched.profile.active) {
@@ -99,7 +187,6 @@ export const App: React.FC = () => {
     }));
     setCurrentUser(updatedProfile);
 
-    // 管理者専任ならADMIN画面、学生または兼務ならまず適切な初期画面へ
     if (updatedProfile.roles.admin && !updatedProfile.roles.student) {
       setActiveViewMode('ADMIN');
     } else {
@@ -117,6 +204,7 @@ export const App: React.FC = () => {
     const entry = usersMap[key];
     if (!entry) return 'ユーザー情報が見つかりません。';
 
+    const newHash = await sha256Hex(newPassword);
     const nowIso = new Date().toISOString();
     const updatedProfile: UserProfile = {
       ...currentUser,
@@ -127,7 +215,7 @@ export const App: React.FC = () => {
     setUsersMap((prev) => ({
       ...prev,
       [key]: {
-        password: newPassword,
+        passwordHash: newHash,
         profile: updatedProfile,
       },
     }));
@@ -192,7 +280,7 @@ export const App: React.FC = () => {
   };
 
   // 管理者：新規学生作成 (#50, #51, #70)
-  const handleCreateStudent = (input: {
+  const handleCreateStudent = async (input: {
     studentId: string;
     name: string;
     email: string;
@@ -203,7 +291,7 @@ export const App: React.FC = () => {
     notificationEnabled: boolean;
     initialPassword: string;
     isAdminAlso: boolean;
-  }): string | null => {
+  }): Promise<string | null> => {
     if (!currentUser?.roles.admin) {
       return '管理者権限が必要です。';
     }
@@ -215,6 +303,7 @@ export const App: React.FC = () => {
       return `メールアドレス ${input.email} は既に登録されています。`;
     }
 
+    const passwordHash = await sha256Hex(input.initialPassword);
     const nowIso = new Date().toISOString();
     const newUid = `uid-${input.studentId.toLowerCase()}`;
 
@@ -249,11 +338,14 @@ export const App: React.FC = () => {
       updatedAt: nowIso,
     };
 
+    const yearEvents =
+      academicYearsMap[selectedAcademicYear]?.events ??
+      DEFAULT_ACADEMIC_EVENTS_2026;
     const gradeTasks = INITIAL_ROADMAP_TASKS.filter(
       (t) => t.grade === input.currentGrade && t.active
     );
     const createdProgress: ProgressRecord[] = gradeTasks.map((task) => {
-      const commonDueDate = calculateCommonDueDate(task, academicEvents);
+      const commonDueDate = calculateCommonDueDate(task, yearEvents);
       const { appliedDueDate, dueSource } = resolveAppliedDueDate(
         null,
         commonDueDate
@@ -281,7 +373,7 @@ export const App: React.FC = () => {
 
     setUsersMap((prev) => ({
       ...prev,
-      [emailKey]: { password: input.initialPassword, profile: newProfile },
+      [emailKey]: { passwordHash, profile: newProfile },
     }));
     setStudents((prev) => [...prev, newStudent]);
     setProgressRecords((prev) => [...prev, ...createdProgress]);
@@ -293,7 +385,10 @@ export const App: React.FC = () => {
         actorEmail: currentUser.email,
         targetType: 'student',
         targetId: input.studentId,
-        details: { currentGrade: input.currentGrade },
+        details: {
+          currentGrade: input.currentGrade,
+          enrollmentYear: input.enrollmentYear,
+        },
         createdAt: nowIso,
       },
       ...prev,
@@ -309,11 +404,14 @@ export const App: React.FC = () => {
     if (!target || target.currentGrade !== 'M1') return;
 
     const nowIso = new Date().toISOString();
+    const yearEvents =
+      academicYearsMap[selectedAcademicYear]?.events ??
+      DEFAULT_ACADEMIC_EVENTS_2026;
     const { updatedStudent, mergedProgress } = promoteStudentToM2(
       target,
       progressRecords.filter((p) => p.studentId === studentId),
       INITIAL_ROADMAP_TASKS,
-      academicEvents,
+      yearEvents,
       currentUser.uid,
       nowIso
     );
@@ -374,16 +472,20 @@ export const App: React.FC = () => {
   };
 
   // 管理者：パスワードリセット (#53: mustChangePassword = TRUE)
-  const handleResetPassword = (studentId: string, tempPassword: string) => {
+  const handleResetPassword = async (
+    studentId: string,
+    tempPassword: string
+  ) => {
     if (!currentUser?.roles.admin) return;
     const nowIso = new Date().toISOString();
+    const newHash = await sha256Hex(tempPassword);
 
     setUsersMap((prev) => {
       const next = { ...prev };
       for (const [k, v] of Object.entries(next)) {
         if (v.profile.studentId === studentId) {
           next[k] = {
-            password: tempPassword,
+            passwordHash: newHash,
             profile: {
               ...v.profile,
               mustChangePassword: true,
@@ -410,18 +512,59 @@ export const App: React.FC = () => {
     ]);
   };
 
-  // 管理者：年度イベント更新と共通期限の自動再計算 (#28, #30, #36)
+  // 管理者：新規年度の追加
+  const handleAddAcademicYear = (year: number) => {
+    if (!currentUser?.roles.admin) return;
+    const nowIso = new Date().toISOString();
+
+    setAcademicYearsMap((prev) => {
+      if (prev[year]) return prev;
+      const yearOffset = year - 2026;
+      const clonedEvents: AcademicEvent[] = DEFAULT_ACADEMIC_EVENTS_2026.map(
+        (ev) => ({
+          ...ev,
+          date: ev.date
+            ? `${Number(ev.date.slice(0, 4)) + yearOffset}${ev.date.slice(4)}`
+            : null,
+        })
+      );
+      return {
+        ...prev,
+        [year]: {
+          year,
+          isCurrent: false,
+          updatedAt: nowIso,
+          events: clonedEvents,
+        },
+      };
+    });
+    setSelectedAcademicYear(year);
+  };
+
+  // 管理者：年度別イベント更新と共通期限の自動再計算 (#28, #30, #36)
   const handleUpdateAcademicEvent = (
+    year: number,
     eventKey: string,
     updates: Partial<AcademicEvent>
   ) => {
     if (!currentUser?.roles.admin) return;
     const nowIso = new Date().toISOString();
 
-    const nextEvents = academicEvents.map((ev) =>
+    const targetYearObj = academicYearsMap[year];
+    if (!targetYearObj) return;
+
+    const nextEvents = targetYearObj.events.map((ev) =>
       ev.eventKey === eventKey ? { ...ev, ...updates } : ev
     );
-    setAcademicEvents(nextEvents);
+
+    setAcademicYearsMap((prev) => ({
+      ...prev,
+      [year]: {
+        ...targetYearObj,
+        updatedAt: nowIso,
+        events: nextEvents,
+      },
+    }));
 
     const taskMap = new Map(INITIAL_ROADMAP_TASKS.map((t) => [t.taskId, t]));
     setProgressRecords((prev) =>
@@ -450,7 +593,7 @@ export const App: React.FC = () => {
         actorUid: currentUser.uid,
         actorEmail: currentUser.email,
         targetType: 'academicEvent',
-        targetId: eventKey,
+        targetId: `${year}_${eventKey}`,
         details: updates,
         createdAt: nowIso,
       },
@@ -460,7 +603,7 @@ export const App: React.FC = () => {
 
   // 1. 未ログイン時はシンプルなログイン画面を表示 (#7)
   if (!currentUser) {
-    return <LoginView onLogin={handleLogin} isDemoMode={true} />;
+    return <LoginView onLogin={handleLogin} />;
   }
 
   // 2. 初回パスワード変更フラグが TRUE の場合はパスワード変更画面を強制表示 (#12)
@@ -565,10 +708,12 @@ export const App: React.FC = () => {
             userProfiles={userProfilesList}
             progressRecords={progressRecords}
             roadmapTasks={INITIAL_ROADMAP_TASKS}
-            academicYear={2026}
-            academicEvents={academicEvents}
+            academicYearsMap={academicYearsMap}
+            selectedAcademicYear={selectedAcademicYear}
             auditLogs={auditLogs}
             todayTokyo={todayTokyo}
+            onSelectAcademicYear={setSelectedAcademicYear}
+            onAddAcademicYear={handleAddAcademicYear}
             onCreateStudent={handleCreateStudent}
             onPromoteToM2={handlePromoteToM2}
             onToggleAccountActive={handleToggleAccountActive}

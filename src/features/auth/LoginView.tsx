@@ -11,10 +11,9 @@ import { AlertCircle, KeyRound, Lock, Mail, ShieldCheck } from 'lucide-react';
 
 interface LoginViewProps {
   onLogin: (email: string, password: string) => Promise<string | null>;
-  isDemoMode: boolean;
 }
 
-export const LoginView: React.FC<LoginViewProps> = ({ onLogin, isDemoMode }) => {
+export const LoginView: React.FC<LoginViewProps> = ({ onLogin }) => {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -32,12 +31,6 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLogin, isDemoMode }) => 
     } finally {
       setSubmitting(false);
     }
-  };
-
-  const fillDemoAccount = (demoEmail: string, demoPass: string) => {
-    setEmail(demoEmail);
-    setPassword(demoPass);
-    setError(null);
   };
 
   return (
@@ -83,7 +76,6 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLogin, isDemoMode }) => 
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   className="block w-full rounded-xl border border-slate-300 py-2.5 pl-10 pr-3 text-sm text-slate-900 focus:border-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-600/20"
-                  placeholder="example@nittai.ac.jp"
                 />
               </div>
             </div>
@@ -124,44 +116,6 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLogin, isDemoMode }) => 
           <p className="mt-6 text-center text-xs text-slate-500">
             パスワードを忘れた場合は管理者へお問い合わせください
           </p>
-
-          {isDemoMode && (
-            <div className="mt-6 border-t border-slate-200 pt-5">
-              <p className="mb-2.5 text-xs font-semibold text-slate-500">
-                開発検証用ワンクリック入力（ローカル検証モード）：
-              </p>
-              <div className="grid grid-cols-2 gap-2 text-xs">
-                <button
-                  type="button"
-                  onClick={() => fillDemoAccount('s001@nittai.ac.jp', 'password123')}
-                  className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2 text-left font-medium text-slate-700 hover:bg-blue-50 hover:text-blue-700"
-                >
-                  学生 (M2・青木)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => fillDemoAccount('s002@nittai.ac.jp', 'initpass123')}
-                  className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2 text-left font-medium text-slate-700 hover:bg-blue-50 hover:text-blue-700"
-                >
-                  学生 (初回PW変更)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => fillDemoAccount('admin@nittai.ac.jp', 'adminpassword')}
-                  className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2 text-left font-medium text-slate-700 hover:bg-blue-50 hover:text-blue-700"
-                >
-                  管理者 (佐藤教授)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => fillDemoAccount('dual@nittai.ac.jp', 'dualpassword')}
-                  className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2 text-left font-medium text-slate-700 hover:bg-blue-50 hover:text-blue-700"
-                >
-                  兼務 (学生＋管理者)
-                </button>
-              </div>
-            </div>
-          )}
         </div>
       </div>
     </div>

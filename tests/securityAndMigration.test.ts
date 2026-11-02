@@ -8,9 +8,13 @@ import { describe, expect, it } from 'vitest';
 import { validateMigrationDataset } from '../scripts/import/validateMigration';
 import { INITIAL_ROADMAP_TASKS } from '../src/data/roadmapSeed';
 import {
-  buildInitialDemoProgress,
+  INITIAL_ADMIN_PASSWORD_SHA256,
   INITIAL_STUDENTS,
+  INITIAL_USERS,
+  SYSTEM_ADMIN_EMAIL,
+  SYSTEM_REMINDER_SENDER_EMAIL,
 } from '../src/data/demoSeed';
+import type { Student } from '../src/types/domain';
 
 describe('Firestore Security Rules Deny-First Verification (#72, #73, #74, #95)', () => {
   const rulesPath = resolve(process.cwd(), 'firestore.rules');
@@ -37,13 +41,26 @@ describe('Firestore Security Rules Deny-First Verification (#72, #73, #74, #95)'
   });
 });
 
+describe('System Configuration & Clean Initial State Verification', () => {
+  it('starts with 0 demo students and configures nittai.daigakuin@gmail.com as admin & reminder sender', () => {
+    expect(INITIAL_STUDENTS).toHaveLength(0);
+    expect(SYSTEM_ADMIN_EMAIL).toBe('nittai.daigakuin@gmail.com');
+    expect(SYSTEM_REMINDER_SENDER_EMAIL).toBe('nittai.daigakuin@gmail.com');
+
+    const adminEntry = INITIAL_USERS[SYSTEM_ADMIN_EMAIL];
+    expect(adminEntry).toBeDefined();
+    expect(adminEntry.profile.displayName).toBe('管理者');
+    expect(adminEntry.profile.roles.admin).toBe(true);
+    expect(adminEntry.passwordHash).toBe(INITIAL_ADMIN_PASSWORD_SHA256);
+  });
+});
+
 describe('Migration Validator Verification (#92)', () => {
-  it('validates the initial 61 roadmap tasks, students, and progress records with zero errors', () => {
-    const progress = buildInitialDemoProgress();
+  it('validates the initial 61 roadmap tasks with zero errors', () => {
     const result = validateMigrationDataset({
       roadmapTasks: INITIAL_ROADMAP_TASKS,
-      students: INITIAL_STUDENTS,
-      progress,
+      students: [],
+      progress: [],
     });
 
     expect(result.valid).toBe(true);
@@ -54,10 +71,24 @@ describe('Migration Validator Verification (#92)', () => {
   });
 
   it('detects duplicate studentId and invalid email format', () => {
-    const badStudents = [
-      ...INITIAL_STUDENTS,
+    const sampleStudent: Student = {
+      studentId: 'S001',
+      name: 'テスト学生',
+      email: 's001@example.ac.jp',
+      course: 'MASTER',
+      currentGrade: 'M1',
+      enrollmentYear: 2026,
+      supervisor: '未設定',
+      enrollmentStatus: '在籍',
+      notificationEnabled: true,
+      notes: '',
+      createdAt: '2026-04-01T00:00:00.000Z',
+      updatedAt: '2026-04-01T00:00:00.000Z',
+    };
+    const badStudents: Student[] = [
+      sampleStudent,
       {
-        ...INITIAL_STUDENTS[0],
+        ...sampleStudent,
         email: 'invalid-email-format',
       },
     ];
