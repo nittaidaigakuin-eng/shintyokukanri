@@ -1,0 +1,160 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =========================================================================
+    // Helper Functions
+    // =========================================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && request.auth.token.admin == true;
+    }
+
+    function isStudent() {
+      return isAuthenticated() && request.auth.token.student == true;
+    }
+
+    function isOwnStudentId(studentId) {
+      return isStudent()
+        && request.auth.token.studentId is string
+        && request.auth.token.studentId == studentId;
+    }
+
+    // Default Deny-First Rule
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // 1. userProfiles/{uid}
+    // =========================================================================
+    match /userProfiles/{uid} {
+      // 本人または管理者のみ読み取り可能
+      allow read: if isAdmin() || (isAuthenticated() && request.auth.uid == uid);
+
+      // 本人は初回パスワード変更完了フラグ (mustChangePassword: false) と最終ログイン日時のみ更新可能
+      // roles, studentId, active, email 等の権限昇格・改ざんは厳禁
+      allow update: if isAdmin() || (
+        isAuthenticated()
+        && request.auth.uid == uid
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.studentId == resource.data.studentId
+        && request.resource.data.roles == resource.data.roles
+        && request.resource.data.active == resource.data.active
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['mustChangePassword', 'lastLoginAt', 'updatedAt'])
+        && request.resource.data.mustChangePassword == false
+      );
+
+      // 作成・削除は Cloud Functions (Admin SDK) または管理者のみ
+      allow create, delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // 2. students/{studentId}
+    // =========================================================================
+    match /students/{studentId} {
+      // 学生本人は自分の studentId のみ読み取り可能。他学生のデータは一切読めない
+      allow read: if isAdmin() || isOwnStudentId(studentId);
+      // 作成・更新・削除は管理者のみ（通常は Cloud Functions 経由）
+      allow create, update, delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // 3. roadmapTasks/{taskId}
+    // =========================================================================
+    match /roadmapTasks/{taskId} {
+      // 共通ロードマップは認証済みユーザーなら読み取り可能
+      allow read: if isAuthenticated();
+      // 変更は管理者のみ
+      allow create, update, delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // 4. academicYears/{year} & events/{eventKey}
+    // =========================================================================
+    match /academicYears/{year} {
+      allow read: if isAuthenticated();
+      allow create, update, delete: if isAdmin();
+
+      match /events/{eventKey} {
+        allow read: if isAuthenticated();
+        allow create, update, delete: if isAdmin();
+      }
+    }
+
+    // =========================================================================
+    // 5. progress/{progressId}
+    // =========================================================================
+    match /progress/{progressId} {
+      // 学生は自分の studentId に紐づく進捗のみ読み取り可能
+      allow read: if isAdmin() || (
+        isStudent() && isOwnStudentId(resource.data.studentId)
+      );
+
+      // 学生による更新：自分の進捗であり、かつ不変フィールド（studentId, taskId, historicalGrade, commonDueDate等）を変更していないこと
+      allow update: if isAdmin() || (
+        isStudent()
+        && isOwnStudentId(resource.data.studentId)
+        && request.resource.data.studentId == resource.data.studentId
+        && request.resource.data.taskId == resource.data.taskId
+        && request.resource.data.progressId == resource.data.progressId
+        && request.resource.data.historicalGrade == resource.data.historicalGrade
+        && request.resource.data.commonDueDate == resource.data.commonDueDate
+        && request.resource.data.category == resource.data.category
+        && request.resource.data.title == resource.data.title
+        && request.resource.data.updatedByUid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'status',
+          'personalTargetDate',
+          'appliedDueDate',
+          'dueSource',
+          'completedAt',
+          'comment',
+          'updatedAt',
+          'updatedByUid'
+        ])
+      );
+
+      // 進捗ドキュメントの新規生成・削除は管理者（またはCloud Functions）のみ
+      allow create, delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // 6. notificationLogs/{notificationId}
+    // =========================================================================
+    match /notificationLogs/{notificationId} {
+      allow read: if isAdmin();
+      allow write: if false; // Cloud Functions (Admin SDK) 専用
+    }
+
+    // =========================================================================
+    // 7. calendarSync/{syncKey}
+    // =========================================================================
+    match /calendarSync/{syncKey} {
+      allow read: if isAdmin();
+      allow write: if false; // Cloud Functions (Admin SDK) 専用
+    }
+
+    // =========================================================================
+    // 8. auditLogs/{auditId}
+    // =========================================================================
+    match /auditLogs/{auditId} {
+      allow read: if isAdmin();
+      allow write: if false; // Cloud Functions (Admin SDK) からの追記専用、改ざん・削除不可
+    }
+
+    // =========================================================================
+    // 9. appConfig/{configKey}
+    // =========================================================================
+    match /appConfig/{configKey} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+  }
+}

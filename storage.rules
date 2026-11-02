@@ -1,0 +1,10 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Deny-first: ファイル管理機能有効化まで全アクセスを拒否
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
