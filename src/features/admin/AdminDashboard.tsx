@@ -1,5 +1,5 @@
 /**
- * 管理者画面（ダッシュボード・問題学生抽出・学生一覧・学生詳細・新規登録・年度別設定・ロードマップ・リマインド通知・監査ログ）
+ * 管理者画面（ダッシュボード・問題学生抽出・学生一覧・在籍状態変更・学生詳細・新規登録・年度別設定・ロードマップ追加/削除/編集・リマインド通知・監査ログ）
  * MASTER_SPEC.md #45〜#53, #57〜#71 に完全準拠
  */
 
@@ -10,12 +10,15 @@ import {
   Bell,
   Calendar,
   Clock,
+  Cloud,
+  Edit3,
   FileSpreadsheet,
   KeyRound,
   Mail,
   Plus,
   Search,
   ShieldAlert,
+  Trash2,
   UserCheck,
   UserPlus,
   Users,
@@ -25,6 +28,8 @@ import type {
   AcademicEvent,
   AcademicYear,
   AuditLog,
+  DeadlineRule,
+  DeadlineType,
   EnrollmentStatus,
   MasterGrade,
   ProgressRecord,
@@ -42,6 +47,10 @@ import {
 } from '../../lib/progressUtils';
 import { SYSTEM_REMINDER_SENDER_EMAIL } from '../../data/demoSeed';
 import { DeadlineBadge, StatusBadge } from '../../components/Badges';
+import {
+  getActiveFirebaseConfig,
+  saveRuntimeFirebaseConfig,
+} from '../../lib/firebase/syncStore';
 
 type AdminSubTab =
   | 'OVERVIEW'
@@ -61,6 +70,7 @@ interface AdminDashboardProps {
   selectedAcademicYear: number;
   auditLogs: AuditLog[];
   todayTokyo: string;
+  isCloudConnected: boolean;
   onSelectAcademicYear: (year: number) => void;
   onAddAcademicYear: (year: number) => void;
   onCreateStudent: (input: {
@@ -75,6 +85,20 @@ interface AdminDashboardProps {
     initialPassword: string;
     isAdminAlso: boolean;
   }) => Promise<string | null>;
+  onUpdateStudentMeta: (
+    studentId: string,
+    updates: Partial<
+      Pick<
+        Student,
+        | 'enrollmentStatus'
+        | 'currentGrade'
+        | 'supervisor'
+        | 'name'
+        | 'notificationEnabled'
+        | 'notes'
+      >
+    >
+  ) => void;
   onPromoteToM2: (studentId: string) => void;
   onToggleAccountActive: (studentId: string, active: boolean) => void;
   onResetPassword: (studentId: string, tempPassword: string) => Promise<void>;
@@ -91,6 +115,19 @@ interface AdminDashboardProps {
     eventKey: string,
     updates: Partial<AcademicEvent>
   ) => void;
+  onAddRoadmapTask: (input: {
+    grade: MasterGrade;
+    category: string;
+    title: string;
+    studentAction: string;
+    guideline: string;
+    deadlineType: DeadlineType;
+    baseEventKey: string | null;
+    offsetDays: number | null;
+    deadlineRule: DeadlineRule;
+  }) => void;
+  onUpdateRoadmapTask: (taskId: string, updates: Partial<RoadmapTask>) => void;
+  onDeleteRoadmapTask: (taskId: string) => void;
 }
 
 export const AdminDashboard: React.FC<AdminDashboardProps> = ({
@@ -102,14 +139,19 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   selectedAcademicYear,
   auditLogs,
   todayTokyo,
+  isCloudConnected,
   onSelectAcademicYear,
   onAddAcademicYear,
   onCreateStudent,
+  onUpdateStudentMeta,
   onPromoteToM2,
   onToggleAccountActive,
   onResetPassword,
   onAdminUpdateProgress,
   onUpdateAcademicEvent,
+  onAddRoadmapTask,
+  onUpdateRoadmapTask,
+  onDeleteRoadmapTask,
 }) => {
   const [subTab, setSubTab] = useState<AdminSubTab>('OVERVIEW');
   const [selectedStudentId, setSelectedStudentId] = useState<string | null>(
@@ -120,7 +162,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [gradeFilter, setGradeFilter] = useState<'ALL' | MasterGrade>('ALL');
   const [supervisorFilter, setSupervisorFilter] = useState<string>('ALL');
   const [statusFilter, setStatusFilter] = useState<'ALL' | EnrollmentStatus>(
-    '在籍'
+    'ALL'
   );
   const [alertFilter, setAlertFilter] = useState<
     'ALL' | 'OVERDUE' | 'DUE_SOON' | 'NO_TARGET' | 'STALE'
@@ -148,6 +190,38 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     selectedAcademicYear + 1
   );
 
+  // タスク追加・編集モーダル用
+  const [roadmapGradeFilter, setRoadmapGradeFilter] = useState<
+    'ALL' | MasterGrade
+  >('ALL');
+  const [showAddTaskModal, setShowAddTaskModal] = useState(false);
+  const [taskGrade, setTaskGrade] = useState<MasterGrade>('M1');
+  const [taskCategory, setTaskCategory] = useState('01_研究計画');
+  const [taskTitle, setTaskTitle] = useState('');
+  const [taskAction, setTaskAction] = useState('');
+  const [taskGuideline, setTaskGuideline] = useState('随時');
+  const [taskDeadlineType, setTaskDeadlineType] =
+    useState<DeadlineType>('PERSONAL');
+  const [taskBaseEventKey, setTaskBaseEventKey] = useState<string>('');
+  const [taskOffsetDays, setTaskOffsetDays] = useState<number>(0);
+  const [taskDeadlineRule, setTaskDeadlineRule] =
+    useState<DeadlineRule>('MANUAL');
+
+  const [editingTaskId, setEditingTaskId] = useState<string | null>(null);
+  const [editTaskTitle, setEditTaskTitle] = useState('');
+  const [editTaskCategory, setEditTaskCategory] = useState('');
+  const [editTaskAction, setEditTaskAction] = useState('');
+  const [editTaskGuideline, setEditTaskGuideline] = useState('');
+
+  // Firebaseクラウド接続モーダル用
+  const [showCloudModal, setShowCloudModal] = useState(false);
+  const existingCfg = getActiveFirebaseConfig();
+  const [fbApiKey, setFbApiKey] = useState(existingCfg?.apiKey ?? '');
+  const [fbProjectId, setFbProjectId] = useState(existingCfg?.projectId ?? '');
+  const [fbAuthDomain, setFbAuthDomain] = useState(
+    existingCfg?.authDomain ?? ''
+  );
+
   // パスワードリセットモーダル (#53)
   const [resetTargetStudentId, setResetTargetStudentId] = useState<
     string | null
@@ -169,6 +243,26 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const academicEvents = useMemo(
     () => currentYearObj?.events ?? [],
     [currentYearObj]
+  );
+
+  const activeRoadmapTasks = useMemo(
+    () =>
+      roadmapTasks
+        .filter((t) => t.active)
+        .sort((a, b) => {
+          if (a.grade !== b.grade) return a.grade.localeCompare(b.grade);
+          return a.displayOrder - b.displayOrder;
+        }),
+    [roadmapTasks]
+  );
+
+  const m1TaskCount = useMemo(
+    () => activeRoadmapTasks.filter((t) => t.grade === 'M1').length,
+    [activeRoadmapTasks]
+  );
+  const m2TaskCount = useMemo(
+    () => activeRoadmapTasks.filter((t) => t.grade === 'M2').length,
+    [activeRoadmapTasks]
   );
 
   // 学生ごとの集計メトリクス計算 (#45, #46, #47)
@@ -347,7 +441,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   // 学生別リマインド通知プレビュー計算 (#57〜#62)
   const studentNotificationQueue = useMemo(() => {
-    const taskMap = new Map(roadmapTasks.map((t) => [t.taskId, t]));
+    const taskMap = new Map(activeRoadmapTasks.map((t) => [t.taskId, t]));
     const items: Array<{
       notificationId: string;
       student: Student;
@@ -394,7 +488,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       }
     }
     return items.sort((a, b) => a.remainingDays - b.remainingDays);
-  }, [students, progressRecords, roadmapTasks, todayTokyo]);
+  }, [students, progressRecords, activeRoadmapTasks, todayTokyo]);
 
   const openStudentDetail = (studentId: string) => {
     setSelectedStudentId(studentId);
@@ -437,12 +531,68 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     setNewInitialPassword('');
   };
 
+  const handleAddTaskSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!taskTitle.trim()) return;
+    onAddRoadmapTask({
+      grade: taskGrade,
+      category: taskCategory.trim() || 'その他',
+      title: taskTitle.trim(),
+      studentAction: taskAction.trim() || taskTitle.trim(),
+      guideline: taskGuideline.trim() || '随時',
+      deadlineType: taskDeadlineType,
+      baseEventKey:
+        taskDeadlineType === 'COMMON_EVENT' && taskBaseEventKey
+          ? taskBaseEventKey
+          : null,
+      offsetDays:
+        taskDeadlineType === 'COMMON_EVENT' ? Number(taskOffsetDays) : null,
+      deadlineRule:
+        taskDeadlineType === 'COMMON_EVENT' ? taskDeadlineRule : 'MANUAL',
+    });
+    setShowAddTaskModal(false);
+    setBannerMessage(
+      `${taskGrade}ロードマップに新規タスク「${taskTitle}」を追加し、該当学年の学生進捗リストへ反映しました。`
+    );
+    setTaskTitle('');
+    setTaskAction('');
+  };
+
+  const startEditTask = (t: RoadmapTask) => {
+    setEditingTaskId(t.taskId);
+    setEditTaskTitle(t.title);
+    setEditTaskCategory(t.category);
+    setEditTaskAction(t.studentAction);
+    setEditTaskGuideline(t.guideline);
+  };
+
+  const saveEditTask = (taskId: string) => {
+    onUpdateRoadmapTask(taskId, {
+      title: editTaskTitle.trim(),
+      category: editTaskCategory.trim(),
+      studentAction: editTaskAction.trim(),
+      guideline: editTaskGuideline.trim(),
+    });
+    setEditingTaskId(null);
+    setBannerMessage(
+      `タスク (${taskId}) の内容を更新し、全学生の進捗表示へ反映しました。`
+    );
+  };
+
   const selectedDetail = useMemo(
     () =>
       studentAnalytics.find(
         (s) => s.student.studentId === selectedStudentId
       ) ?? null,
     [studentAnalytics, selectedStudentId]
+  );
+
+  const displayedRoadmapTasks = useMemo(
+    () =>
+      activeRoadmapTasks.filter(
+        (t) => roadmapGradeFilter === 'ALL' || t.grade === roadmapGradeFilter
+      ),
+    [activeRoadmapTasks, roadmapGradeFilter]
   );
 
   return (
@@ -455,7 +605,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               ['OVERVIEW', '要対応・ダッシュボード'],
               ['STUDENTS', `学生一覧 (${students.length}名)`],
               ['ACADEMIC_YEAR', `年度別設定 (${selectedAcademicYear}年度)`],
-              ['ROADMAP', '修士ロードマップ (61件)'],
+              [
+                'ROADMAP',
+                `ロードマップ管理 (${activeRoadmapTasks.length}件)`,
+              ],
               ['NOTIFICATIONS', '通知・リマインド設定'],
               ['AUDIT', '監査ログ'],
             ] as Array<[AdminSubTab, string]>
@@ -476,14 +629,31 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           ))}
         </div>
 
-        <button
-          type="button"
-          onClick={openCreateModalWithNextId}
-          className="inline-flex items-center gap-1.5 rounded-xl bg-[#2563EB] px-4 py-2 text-xs font-semibold text-white shadow-xs hover:bg-blue-700"
-        >
-          <UserPlus className="h-4 w-4" />
-          新規学生登録
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setShowCloudModal(true)}
+            className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-semibold ${
+              isCloudConnected
+                ? 'border-green-200 bg-green-50 text-green-800'
+                : 'border-slate-300 bg-slate-50 text-slate-700 hover:bg-slate-100'
+            }`}
+          >
+            <Cloud className="h-3.5 w-3.5" />
+            {isCloudConnected
+              ? 'Firebaseクラウド同期中'
+              : '同一端末保存モード（クラウド接続設定）'}
+          </button>
+
+          <button
+            type="button"
+            onClick={openCreateModalWithNextId}
+            className="inline-flex items-center gap-1.5 rounded-xl bg-[#2563EB] px-4 py-2 text-xs font-semibold text-white shadow-xs hover:bg-blue-700"
+          >
+            <UserPlus className="h-4 w-4" />
+            新規学生登録
+          </button>
+        </div>
       </div>
 
       {bannerMessage && (
@@ -717,7 +887,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               <div className="mt-4 space-y-4">
                 <div>
                   <div className="flex justify-between text-xs font-semibold">
-                    <span>M1（{kpiCounts.m1Count}名 / 17項目基準）</span>
+                    <span>
+                      M1（{kpiCounts.m1Count}名 / {m1TaskCount}項目基準）
+                    </span>
                     <span>{kpiCounts.m1Avg}%</span>
                   </div>
                   <div className="mt-1.5 h-2.5 w-full overflow-hidden rounded-full bg-slate-100">
@@ -729,7 +901,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 </div>
                 <div>
                   <div className="flex justify-between text-xs font-semibold">
-                    <span>M2（{kpiCounts.m2Count}名 / 44項目基準）</span>
+                    <span>
+                      M2（{kpiCounts.m2Count}名 / {m2TaskCount}項目基準）
+                    </span>
                     <span>{kpiCounts.m2Avg}%</span>
                   </div>
                   <div className="mt-1.5 h-2.5 w-full overflow-hidden rounded-full bg-slate-100">
@@ -803,7 +977,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       )}
 
       {/* =====================================================================
-          TAB 2: 学生一覧・フィルタ・検索 (#47, #48)
+          TAB 2: 学生一覧・在籍状態変更・フィルタ・検索 (#23, #47, #48)
          ===================================================================== */}
       {subTab === 'STUDENTS' && (
         <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs">
@@ -859,11 +1033,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 }
                 className="rounded-xl border border-slate-300 px-3 py-1.5 text-xs"
               >
-                <option value="ALL">全在籍状態</option>
-                <option value="在籍">在籍</option>
-                <option value="休学">休学</option>
-                <option value="修了">修了</option>
-                <option value="退学">退学</option>
+                <option value="ALL">全在籍状態（在籍・休学・修了・退学）</option>
+                <option value="在籍">在籍のみ</option>
+                <option value="休学">休学のみ</option>
+                <option value="修了">修了のみ</option>
+                <option value="退学">退学のみ</option>
               </select>
 
               <select
@@ -899,7 +1073,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 <thead>
                   <tr className="bg-slate-50 font-bold text-slate-600">
                     <th className="px-3 py-3">氏名 / ID / 通知先メール</th>
-                    <th className="px-3 py-3">学年 / 入学年度</th>
+                    <th className="px-3 py-3">学年</th>
+                    <th className="px-3 py-3">在籍状態（変更可）</th>
                     <th className="px-3 py-3">進捗率</th>
                     <th className="px-3 py-3">次の期限</th>
                     <th className="px-3 py-3">期限超過数</th>
@@ -921,17 +1096,38 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                             {student.name}
                           </div>
                           <div className="text-[11px] text-slate-500">
-                            {student.studentId} / 宛先: {student.email}
+                            {student.studentId} / {student.email}
                           </div>
                         </td>
                         <td className="px-3 py-3.5">
                           <span className="rounded bg-[#0B1F3A] px-2 py-0.5 font-bold text-white">
                             {student.currentGrade}
                           </span>
-                          <span className="ml-1.5 text-slate-500">
-                            ({student.enrollmentYear}年度 /{' '}
-                            {student.enrollmentStatus})
-                          </span>
+                          <div className="mt-0.5 text-[11px] text-slate-500">
+                            {student.enrollmentYear}年度入学
+                          </div>
+                        </td>
+                        <td className="px-3 py-3.5">
+                          {/* 在籍・休学・修了・退学を一覧上でいつでも変更可能 */}
+                          <select
+                            value={student.enrollmentStatus}
+                            onChange={(e) => {
+                              const nextStatus = e.target
+                                .value as EnrollmentStatus;
+                              onUpdateStudentMeta(student.studentId, {
+                                enrollmentStatus: nextStatus,
+                              });
+                              setBannerMessage(
+                                `${student.name} の在籍状態を「${nextStatus}」に変更しました。`
+                              );
+                            }}
+                            className="rounded-lg border border-slate-300 bg-white px-2.5 py-1 text-xs font-semibold text-slate-800"
+                          >
+                            <option value="在籍">在籍</option>
+                            <option value="休学">休学</option>
+                            <option value="修了">修了</option>
+                            <option value="退学">退学</option>
+                          </select>
                         </td>
                         <td className="px-3 py-3.5">
                           <div className="font-bold text-slate-900">
@@ -971,7 +1167,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           )}
                         </td>
                         <td className="px-3 py-3.5 text-slate-600">
-                          {student.updatedAt.slice(0, 10)}
+                          {student.updatedAt.slice(0, 16).replace('T', ' ')}
                         </td>
                         <td className="px-3 py-3.5 text-slate-700">
                           {student.supervisor}
@@ -982,7 +1178,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                             onClick={() => openStudentDetail(student.studentId)}
                             className="rounded-lg border border-blue-600 px-3 py-1.5 font-semibold text-blue-600 hover:bg-blue-50"
                           >
-                            詳細を開く
+                            詳細・進捗編集
                           </button>
                         </td>
                       </tr>
@@ -996,7 +1192,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       )}
 
       {/* =====================================================================
-          TAB 3: 学生詳細（プロフィール・M1/M2進捗・M1→M2進級・PWリセット・無効化 #49, #52, #53）
+          TAB 3: 学生詳細（在籍状態変更・M1/M2進捗・M1→M2進級・PWリセット・無効化 #49, #52, #53）
          ===================================================================== */}
       {subTab === 'STUDENT_DETAIL' && selectedDetail && (
         <StudentDetailPanel
@@ -1006,10 +1202,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           )}
           todayTokyo={todayTokyo}
           onBack={() => setSubTab('STUDENTS')}
+          onUpdateStudentMeta={(updates) => {
+            onUpdateStudentMeta(selectedDetail.student.studentId, updates);
+            setBannerMessage(
+              `${selectedDetail.student.name} の学生情報を更新しました。`
+            );
+          }}
           onPromoteToM2={() => {
             onPromoteToM2(selectedDetail.student.studentId);
             setBannerMessage(
-              `${selectedDetail.student.name} を M1 → M2 へ進級しました（M1履歴17件は保持されたまま、M2用44件が生成されました）。`
+              `${selectedDetail.student.name} を M1 → M2 へ進級しました（M1履歴は保持されたまま、M2用タスクが生成されました）。`
             );
           }}
           onToggleActive={(active) => {
@@ -1165,23 +1367,55 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       )}
 
       {/* =====================================================================
-          TAB 5: 修士ロードマップ一覧 (M1: 17件, M2: 44件, 計61件 #24〜#26)
+          TAB 5: 修士ロードマップ管理（タスクの追加・編集・削除）
          ===================================================================== */}
       {subTab === 'ROADMAP' && (
         <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs">
-          <div className="flex items-center gap-2 border-b border-slate-200 pb-4">
-            <FileSpreadsheet className="h-5 w-5 text-[#0B1F3A]" />
-            <div>
-              <h2 className="text-base font-bold text-[#0B1F3A]">
-                修士課程 共通研究ロードマップマスター（全61件：M1=17件 / M2=44件）
-              </h2>
-              <p className="text-xs text-slate-500">
-                taskId は不変です。全学生共通の基準タスクとして管理されます。
-              </p>
+          <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-200 pb-4">
+            <div className="flex items-center gap-2">
+              <FileSpreadsheet className="h-5 w-5 text-[#0B1F3A]" />
+              <div>
+                <h2 className="text-base font-bold text-[#0B1F3A]">
+                  修士課程 共通研究ロードマップ管理（現在有効: 合計
+                  {activeRoadmapTasks.length}件 / M1={m1TaskCount}件, M2=
+                  {m2TaskCount}件）
+                </h2>
+                <p className="text-xs text-slate-500">
+                  タスクの追加・編集・削除を行うと、該当学年の全学生の進捗リストへ即座に反映されます。
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <div className="inline-flex rounded-xl bg-slate-100 p-1">
+                {(['ALL', 'M1', 'M2'] as const).map((g) => (
+                  <button
+                    key={g}
+                    type="button"
+                    onClick={() => setRoadmapGradeFilter(g)}
+                    className={`rounded-lg px-3 py-1 text-xs font-bold ${
+                      roadmapGradeFilter === g
+                        ? 'bg-[#0B1F3A] text-white'
+                        : 'text-slate-600'
+                    }`}
+                  >
+                    {g === 'ALL' ? 'すべて' : g}
+                  </button>
+                ))}
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setShowAddTaskModal(true)}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-[#2563EB] px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700"
+              >
+                <Plus className="h-4 w-4" />
+                新規タスクを追加
+              </button>
             </div>
           </div>
 
-          <div className="mt-4 max-h-[600px] overflow-y-auto">
+          <div className="mt-4 max-h-[650px] overflow-y-auto">
             <table className="min-w-full divide-y divide-slate-200 text-left text-xs">
               <thead className="sticky top-0 bg-slate-50 font-bold text-slate-600">
                 <tr>
@@ -1190,41 +1424,126 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   <th className="px-3 py-2.5">カテゴリ</th>
                   <th className="px-3 py-2.5">項目名 / 学生アクション</th>
                   <th className="px-3 py-2.5">時期目安</th>
-                  <th className="px-3 py-2.5">期限ルール</th>
+                  <th className="px-3 py-2.5 text-right">操作</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {roadmapTasks.map((t) => (
-                  <tr key={t.taskId}>
-                    <td className="px-3 py-2.5 font-mono font-bold text-slate-800">
-                      {t.taskId}
-                    </td>
-                    <td className="px-3 py-2.5">
-                      <span className="rounded bg-slate-100 px-2 py-0.5 font-bold">
-                        {t.grade}
-                      </span>
-                    </td>
-                    <td className="px-3 py-2.5 text-slate-600">{t.category}</td>
-                    <td className="px-3 py-2.5">
-                      <div className="font-bold text-slate-900">{t.title}</div>
-                      <div className="text-[11px] text-slate-500">
-                        {t.studentAction}
-                      </div>
-                    </td>
-                    <td className="px-3 py-2.5 text-slate-600">
-                      {t.guideline}
-                    </td>
-                    <td className="px-3 py-2.5 text-slate-600">
-                      {t.deadlineType === 'COMMON_EVENT'
-                        ? `${t.baseEventKey} (${
-                            t.deadlineRule === 'PREVIOUS_MONDAY'
-                              ? '直前月曜'
-                              : `${t.offsetDays ?? 0}日`
-                          })`
-                        : '個人目標日中心'}
-                    </td>
-                  </tr>
-                ))}
+                {displayedRoadmapTasks.map((t) => {
+                  const isEditingThis = editingTaskId === t.taskId;
+                  return (
+                    <tr key={t.taskId} className="hover:bg-slate-50/70">
+                      <td className="px-3 py-2.5 font-mono font-bold text-slate-800">
+                        {t.taskId}
+                      </td>
+                      <td className="px-3 py-2.5">
+                        <span className="rounded bg-slate-100 px-2 py-0.5 font-bold">
+                          {t.grade}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2.5 text-slate-600">
+                        {isEditingThis ? (
+                          <input
+                            type="text"
+                            value={editTaskCategory}
+                            onChange={(e) =>
+                              setEditTaskCategory(e.target.value)
+                            }
+                            className="w-full rounded border border-slate-300 px-2 py-1 text-xs"
+                          />
+                        ) : (
+                          t.category
+                        )}
+                      </td>
+                      <td className="px-3 py-2.5">
+                        {isEditingThis ? (
+                          <div className="space-y-1.5">
+                            <input
+                              type="text"
+                              value={editTaskTitle}
+                              onChange={(e) => setEditTaskTitle(e.target.value)}
+                              className="w-full rounded border border-slate-300 px-2 py-1 text-xs font-bold"
+                            />
+                            <input
+                              type="text"
+                              value={editTaskAction}
+                              onChange={(e) =>
+                                setEditTaskAction(e.target.value)
+                              }
+                              className="w-full rounded border border-slate-300 px-2 py-1 text-xs"
+                            />
+                          </div>
+                        ) : (
+                          <>
+                            <div className="font-bold text-slate-900">
+                              {t.title}
+                            </div>
+                            <div className="text-[11px] text-slate-500">
+                              {t.studentAction}
+                            </div>
+                          </>
+                        )}
+                      </td>
+                      <td className="px-3 py-2.5 text-slate-600">
+                        {isEditingThis ? (
+                          <input
+                            type="text"
+                            value={editTaskGuideline}
+                            onChange={(e) =>
+                              setEditTaskGuideline(e.target.value)
+                            }
+                            className="w-24 rounded border border-slate-300 px-2 py-1 text-xs"
+                          />
+                        ) : (
+                          t.guideline
+                        )}
+                      </td>
+                      <td className="px-3 py-2.5 text-right">
+                        {isEditingThis ? (
+                          <div className="inline-flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => saveEditTask(t.taskId)}
+                              className="rounded bg-[#2563EB] px-2.5 py-1 font-semibold text-white"
+                            >
+                              保存
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setEditingTaskId(null)}
+                              className="rounded border border-slate-300 px-2 py-1 text-slate-600"
+                            >
+                              取消
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="inline-flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => startEditTask(t)}
+                              className="inline-flex items-center gap-1 rounded border border-slate-300 px-2 py-1 text-slate-700 hover:bg-slate-100"
+                            >
+                              <Edit3 className="h-3 w-3" />
+                              編集
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                onDeleteRoadmapTask(t.taskId);
+                                setBannerMessage(
+                                  `タスク「${t.title} (${t.taskId})」を削除しました。`
+                                );
+                              }}
+                              className="inline-flex items-center gap-1 rounded border border-red-200 px-2 py-1 text-red-600 hover:bg-red-50"
+                            >
+                              <Trash2 className="h-3 w-3" />
+                              削除
+                            </button>
+                          </div>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -1301,8 +1620,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         送信元: {SYSTEM_REMINDER_SENDER_EMAIL}
                       </span>
                       <p className="mt-0.5 font-medium text-slate-700">
-                        対象タスク: [{item.record.taskId}] {item.record.title}（期限:{' '}
-                        {item.record.appliedDueDate}）
+                        対象タスク: [{item.record.taskId}] {item.record.title}
+                        （期限: {item.record.appliedDueDate}）
                       </p>
                     </div>
                     <div className="flex items-center gap-2">
@@ -1336,7 +1655,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             監査ログ（重要管理操作履歴）
           </h2>
           <p className="mt-1 text-xs text-slate-500">
-            学生作成・無効化・進級・パスワードリセット・年度設定変更等の操作を自動記録します（パスワード等の機密情報は記録しません）。
+            学生作成・在籍変更・進級・パスワードリセット・年度設定変更・タスク増減等の操作を自動記録します。
           </p>
           {auditLogs.length === 0 ? (
             <p className="mt-4 py-6 text-center text-xs text-slate-500">
@@ -1367,6 +1686,256 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               ))}
             </div>
           )}
+        </div>
+      )}
+
+      {/* 新規ロードマップタスク追加モーダル */}
+      {showAddTaskModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
+          <div className="w-full max-w-lg rounded-2xl bg-white p-6 shadow-xl">
+            <h3 className="text-base font-bold text-[#0B1F3A]">
+              ロードマップへ新規タスクを追加
+            </h3>
+            <p className="mt-1 text-xs text-slate-500">
+              追加したタスクは、対象学年（M1またはM2）の全学生の進捗一覧にも自動的に追加されます。
+            </p>
+
+            <form
+              className="mt-4 space-y-3 text-xs"
+              onSubmit={handleAddTaskSubmit}
+            >
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="font-bold text-slate-700">対象学年</label>
+                  <select
+                    value={taskGrade}
+                    onChange={(e) =>
+                      setTaskGrade(e.target.value as MasterGrade)
+                    }
+                    className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+                  >
+                    <option value="M1">M1</option>
+                    <option value="M2">M2</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="font-bold text-slate-700">カテゴリ名</label>
+                  <input
+                    type="text"
+                    required
+                    value={taskCategory}
+                    onChange={(e) => setTaskCategory(e.target.value)}
+                    placeholder="例: 03_研究計画"
+                    className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="font-bold text-slate-700">
+                  タスク項目名（タイトル）
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={taskTitle}
+                  onChange={(e) => setTaskTitle(e.target.value)}
+                  placeholder="例: 中間発表スライドの指導教員チェック"
+                  className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+                />
+              </div>
+
+              <div>
+                <label className="font-bold text-slate-700">
+                  学生が取るべき行動（説明）
+                </label>
+                <input
+                  type="text"
+                  value={taskAction}
+                  onChange={(e) => setTaskAction(e.target.value)}
+                  placeholder="例: 発表7日前までに指導教員へスライド案を提出し確認を受ける"
+                  className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="font-bold text-slate-700">時期目安</label>
+                  <input
+                    type="text"
+                    value={taskGuideline}
+                    onChange={(e) => setTaskGuideline(e.target.value)}
+                    placeholder="例: 7月上旬"
+                    className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+                  />
+                </div>
+                <div>
+                  <label className="font-bold text-slate-700">期限種別</label>
+                  <select
+                    value={taskDeadlineType}
+                    onChange={(e) =>
+                      setTaskDeadlineType(e.target.value as DeadlineType)
+                    }
+                    className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+                  >
+                    <option value="PERSONAL">個人目標日中心</option>
+                    <option value="COMMON_EVENT">年度公式イベント基準</option>
+                  </select>
+                </div>
+              </div>
+
+              {taskDeadlineType === 'COMMON_EVENT' && (
+                <div className="grid grid-cols-3 gap-2 rounded-xl bg-slate-50 p-3">
+                  <div>
+                    <label className="font-bold text-slate-700">
+                      基準イベント
+                    </label>
+                    <select
+                      value={taskBaseEventKey}
+                      onChange={(e) => setTaskBaseEventKey(e.target.value)}
+                      className="mt-1 w-full rounded border border-slate-300 bg-white px-2 py-1.5"
+                    >
+                      <option value="">選択してください</option>
+                      {academicEvents.map((ev) => (
+                        <option key={ev.eventKey} value={ev.eventKey}>
+                          {ev.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="font-bold text-slate-700">
+                      相対日数 (offset)
+                    </label>
+                    <input
+                      type="number"
+                      value={taskOffsetDays}
+                      onChange={(e) =>
+                        setTaskOffsetDays(Number(e.target.value))
+                      }
+                      className="mt-1 w-full rounded border border-slate-300 bg-white px-2 py-1.5"
+                    />
+                  </div>
+                  <div>
+                    <label className="font-bold text-slate-700">算出規則</label>
+                    <select
+                      value={taskDeadlineRule}
+                      onChange={(e) =>
+                        setTaskDeadlineRule(e.target.value as DeadlineRule)
+                      }
+                      className="mt-1 w-full rounded border border-slate-300 bg-white px-2 py-1.5"
+                    >
+                      <option value="EXACT">指定日そのまま</option>
+                      <option value="PREVIOUS_MONDAY">直前月曜</option>
+                    </select>
+                  </div>
+                </div>
+              )}
+
+              <div className="mt-5 flex justify-end gap-2 pt-3">
+                <button
+                  type="button"
+                  onClick={() => setShowAddTaskModal(false)}
+                  className="rounded-xl border border-slate-300 px-4 py-2 font-semibold text-slate-700"
+                >
+                  キャンセル
+                </button>
+                <button
+                  type="submit"
+                  className="inline-flex items-center gap-1 rounded-xl bg-[#2563EB] px-4 py-2 font-semibold text-white hover:bg-blue-700"
+                >
+                  <Plus className="h-4 w-4" />
+                  タスクを追加する
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Firebaseクラウド接続設定モーダル */}
+      {showCloudModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
+          <div className="w-full max-w-lg rounded-2xl bg-white p-6 shadow-xl">
+            <h3 className="text-base font-bold text-[#0B1F3A]">
+              別PC・スマホ間のリアルタイム共有（Firebase Cloud Firestore 接続）
+            </h3>
+            <p className="mt-1 text-xs leading-relaxed text-slate-600">
+              同一PC・同一ブラウザ内の別タブ間では現在もリアルタイムに連動しますが、
+              <strong>
+                学生のスマートフォンや別PCからの更新を先生のPCへインターネット越しにリアルタイム反映
+              </strong>
+              するには、Firebase Consoleのウェブアプリ設定値（またはCloudflare
+              Pagesの環境変数 `VITE_FIREBASE_API_KEY` / `VITE_FIREBASE_PROJECT_ID`）を入力してください。
+            </p>
+
+            <div className="mt-4 space-y-3 text-xs">
+              <div>
+                <label className="font-bold text-slate-700">
+                  Firebase Project ID (`projectId`)
+                </label>
+                <input
+                  type="text"
+                  value={fbProjectId}
+                  onChange={(e) => setFbProjectId(e.target.value)}
+                  placeholder="例: shintyokukanri-dev"
+                  className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+                />
+              </div>
+              <div>
+                <label className="font-bold text-slate-700">
+                  Firebase Web API Key (`apiKey`)
+                </label>
+                <input
+                  type="text"
+                  value={fbApiKey}
+                  onChange={(e) => setFbApiKey(e.target.value)}
+                  placeholder="AIzaSy..."
+                  className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+                />
+              </div>
+              <div>
+                <label className="font-bold text-slate-700">
+                  Auth Domain (`authDomain`・省略時は自動補完)
+                </label>
+                <input
+                  type="text"
+                  value={fbAuthDomain}
+                  onChange={(e) => setFbAuthDomain(e.target.value)}
+                  placeholder="例: shintyokukanri-dev.firebaseapp.com"
+                  className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+                />
+              </div>
+            </div>
+
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setShowCloudModal(false)}
+                className="rounded-xl border border-slate-300 px-4 py-2 text-xs font-semibold text-slate-700"
+              >
+                閉じる
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (fbApiKey.trim() && fbProjectId.trim()) {
+                    saveRuntimeFirebaseConfig({
+                      apiKey: fbApiKey.trim(),
+                      projectId: fbProjectId.trim(),
+                      authDomain:
+                        fbAuthDomain.trim() ||
+                        `${fbProjectId.trim()}.firebaseapp.com`,
+                    });
+                    window.location.reload();
+                  }
+                }}
+                className="rounded-xl bg-[#2563EB] px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700"
+              >
+                保存してクラウド接続を有効化
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -1450,8 +2019,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     onChange={(e) => setNewGrade(e.target.value as MasterGrade)}
                     className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
                   >
-                    <option value="M1">M1 (17件生成)</option>
-                    <option value="M2">M2 (44件生成)</option>
+                    <option value="M1">M1 ({m1TaskCount}件生成)</option>
+                    <option value="M2">M2 ({m2TaskCount}件生成)</option>
                   </select>
                 </div>
                 <div>
@@ -1477,6 +2046,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   >
                     <option value="在籍">在籍</option>
                     <option value="休学">休学</option>
+                    <option value="修了">修了</option>
+                    <option value="退学">退学</option>
                   </select>
                 </div>
               </div>
@@ -1597,6 +2168,19 @@ interface StudentDetailPanelProps {
   progressRecords: ProgressRecord[];
   todayTokyo: string;
   onBack: () => void;
+  onUpdateStudentMeta: (
+    updates: Partial<
+      Pick<
+        Student,
+        | 'enrollmentStatus'
+        | 'currentGrade'
+        | 'supervisor'
+        | 'name'
+        | 'notificationEnabled'
+        | 'notes'
+      >
+    >
+  ) => void;
   onPromoteToM2: () => void;
   onToggleActive: (active: boolean) => void;
   onOpenResetModal: () => void;
@@ -1615,6 +2199,7 @@ const StudentDetailPanel: React.FC<StudentDetailPanelProps> = ({
   progressRecords,
   todayTokyo,
   onBack,
+  onUpdateStudentMeta,
   onPromoteToM2,
   onToggleActive,
   onOpenResetModal,
@@ -1645,25 +2230,43 @@ const StudentDetailPanel: React.FC<StudentDetailPanelProps> = ({
             >
               ← 学生一覧へ戻る
             </button>
-            <div className="mt-2 flex items-center gap-3">
+            <div className="mt-2 flex flex-wrap items-center gap-3">
               <span className="rounded-lg bg-[#0B1F3A] px-2.5 py-1 text-xs font-bold text-white">
                 {student.currentGrade}
               </span>
               <h2 className="text-lg font-bold text-slate-900">
                 {student.name}（{student.studentId}）
               </h2>
-              <span className="rounded-full bg-slate-100 px-2.5 py-0.5 text-xs font-semibold text-slate-700">
-                {student.enrollmentStatus}
-              </span>
+
+              {/* 在籍状態の即時変更セレクター (#23) */}
+              <div className="inline-flex items-center gap-1.5 text-xs">
+                <span className="font-semibold text-slate-500">在籍状態:</span>
+                <select
+                  value={student.enrollmentStatus}
+                  onChange={(e) =>
+                    onUpdateStudentMeta({
+                      enrollmentStatus: e.target.value as EnrollmentStatus,
+                    })
+                  }
+                  className="rounded-lg border border-slate-300 bg-slate-50 px-2.5 py-1 font-bold text-[#0B1F3A]"
+                >
+                  <option value="在籍">在籍</option>
+                  <option value="休学">休学</option>
+                  <option value="修了">修了</option>
+                  <option value="退学">退学</option>
+                </select>
+              </div>
+
               {!isActive && (
                 <span className="rounded-full bg-red-100 px-2.5 py-0.5 text-xs font-bold text-red-700">
                   アカウント利用停止中
                 </span>
               )}
             </div>
-            <p className="mt-1 text-xs text-slate-500">
+            <p className="mt-1.5 text-xs text-slate-500">
               通知宛先メール: {student.email} / 指導教員: {student.supervisor} /
-              入学年度: {student.enrollmentYear}年 / 最終ログイン:{' '}
+              入学年度: {student.enrollmentYear}年 / 最終更新:{' '}
+              {student.updatedAt.slice(0, 16).replace('T', ' ')} / 最終ログイン:{' '}
               {profile?.lastLoginAt?.slice(0, 16).replace('T', ' ') ??
                 '未ログイン'}
               {profile?.mustChangePassword ? '（初回PW変更待ち）' : ''}
@@ -1734,7 +2337,7 @@ const StudentDetailPanel: React.FC<StudentDetailPanelProps> = ({
                   : 'text-slate-600'
               }`}
             >
-              M1 進捗履歴 (17件)
+              M1 進捗履歴
             </button>
             <button
               type="button"
@@ -1745,7 +2348,7 @@ const StudentDetailPanel: React.FC<StudentDetailPanelProps> = ({
                   : 'text-slate-600'
               }`}
             >
-              M2 進捗 (44件)
+              M2 進捗
             </button>
           </div>
         </div>
