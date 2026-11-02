@@ -11,6 +11,7 @@ import {
   INITIAL_ADMIN_PASSWORD_SHA256,
   INITIAL_STUDENTS,
   INITIAL_USERS,
+  sha256Hex,
   SYSTEM_ADMIN_EMAIL,
   SYSTEM_REMINDER_SENDER_EMAIL,
 } from '../src/data/demoSeed';
@@ -42,7 +43,7 @@ describe('Firestore Security Rules Deny-First Verification (#72, #73, #74, #95)'
 });
 
 describe('System Configuration & Clean Initial State Verification', () => {
-  it('starts with 0 demo students and configures nittai.daigakuin@gmail.com as admin & reminder sender', () => {
+  it('starts with 0 demo students and configures nittai.daigakuin@gmail.com as admin & reminder sender', async () => {
     expect(INITIAL_STUDENTS).toHaveLength(0);
     expect(SYSTEM_ADMIN_EMAIL).toBe('nittai.daigakuin@gmail.com');
     expect(SYSTEM_REMINDER_SENDER_EMAIL).toBe('nittai.daigakuin@gmail.com');
@@ -52,6 +53,9 @@ describe('System Configuration & Clean Initial State Verification', () => {
     expect(adminEntry.profile.displayName).toBe('管理者');
     expect(adminEntry.profile.roles.admin).toBe(true);
     expect(adminEntry.passwordHash).toBe(INITIAL_ADMIN_PASSWORD_SHA256);
+
+    const computed = await sha256Hex('nittaidai19851008daigakuin');
+    expect(computed).toBe(INITIAL_ADMIN_PASSWORD_SHA256);
   });
 });
 

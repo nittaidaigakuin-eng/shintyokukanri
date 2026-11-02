@@ -49,12 +49,12 @@ import { StudentDashboard } from './features/student/StudentDashboard';
 import { AdminDashboard } from './features/admin/AdminDashboard';
 
 const STORAGE_KEYS = {
-  users: 'shintyokukanri_v1_users',
-  students: 'shintyokukanri_v1_students',
-  academicYears: 'shintyokukanri_v1_academic_years',
-  selectedYear: 'shintyokukanri_v1_selected_year',
-  progress: 'shintyokukanri_v1_progress',
-  audit: 'shintyokukanri_v1_audit',
+  users: 'shintyokukanri_v2_users',
+  students: 'shintyokukanri_v2_students',
+  academicYears: 'shintyokukanri_v2_academic_years',
+  selectedYear: 'shintyokukanri_v2_selected_year',
+  progress: 'shintyokukanri_v2_progress',
+  audit: 'shintyokukanri_v2_audit',
 };
 
 function loadPersisted<T>(key: string, fallback: T): T {

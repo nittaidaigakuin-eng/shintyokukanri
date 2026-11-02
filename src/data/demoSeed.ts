@@ -20,7 +20,7 @@ export const SYSTEM_REMINDER_SENDER_EMAIL = 'nittai.daigakuin@gmail.com';
 
 // SHA-256 digest of the initial admin password (no plaintext password stored in repository)
 export const INITIAL_ADMIN_PASSWORD_SHA256 =
-  'b0ca00cc7e37fb0f8fc20e88962bc5fa718fe46be72c64de0b970c8b0bd94b19';
+  'f28fe1424e68063026410825f32325d7279602e4a67dcd7c3e613133f7d6c2a4';
 
 export async function sha256Hex(text: string): Promise<string> {
   const encoded = new TextEncoder().encode(text);
