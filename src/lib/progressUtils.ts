@@ -494,3 +494,184 @@ export function mergeBidirectionalCalendarEvents(
   };
 }
 
+/**
+ * Googleスプレッドシート ⇄ Webアプリ 双方向同期（日付・進捗・予定の相互修正）
+ * - Webアプリ側からスプレッドシートのシート構成を自動生成・整形しつつ、
+ *   スプレッドシート上で直接書き換えられた「イベント日付」「個人目標日」「ステータス」「コメント」を
+ *   updatedAt 比較（または差分検出）で Webアプリ側へ安全に取り込み、共通期限も自動再計算する。
+ */
+export interface ExternalSpreadsheetEventRow {
+  eventKey: string;
+  name: string;
+  eventCategory?: 'OFFICIAL' | 'CLASS' | 'LAB_EVENT';
+  target?: MasterGrade | 'ALL';
+  date: string | null;
+  time?: string | null;
+  calendarDisplay?: boolean;
+  notes?: string;
+  updatedAt?: string;
+}
+
+export interface ExternalSpreadsheetProgressRow {
+  progressId: string;
+  studentId: string;
+  taskId: string;
+  status: ProgressStatus;
+  personalTargetDate: string | null;
+  comment: string;
+  updatedAt?: string;
+}
+
+export function mergeBidirectionalSpreadsheetData(params: {
+  localEvents: AcademicEvent[];
+  localProgress: ProgressRecord[];
+  roadmapTasks: RoadmapTask[];
+  remoteEventRows: ExternalSpreadsheetEventRow[];
+  remoteProgressRows: ExternalSpreadsheetProgressRow[];
+  nowIso?: string;
+}): {
+  mergedEvents: AcademicEvent[];
+  mergedProgress: ProgressRecord[];
+  updatedEventCount: number;
+  updatedProgressCount: number;
+} {
+  const nowIso = params.nowIso ?? new Date().toISOString();
+  const eventMap = new Map<string, AcademicEvent>();
+  for (const ev of params.localEvents) {
+    eventMap.set(ev.eventKey, { ...ev });
+  }
+
+  let updatedEventCount = 0;
+
+  for (const row of params.remoteEventRows) {
+    if (!row.eventKey) continue;
+    const normalizedDate = isValidDateString(row.date) ? row.date : null;
+    const existing = eventMap.get(row.eventKey);
+    if (existing) {
+      const localUpdated = existing.updatedAt ?? '1970-01-01T00:00:00.000Z';
+      const remoteUpdated = row.updatedAt ?? '';
+      const hasDiff =
+        existing.date !== normalizedDate ||
+        existing.name !== (row.name || existing.name) ||
+        (row.time !== undefined && existing.time !== row.time) ||
+        (row.notes !== undefined && existing.notes !== row.notes);
+
+      if (hasDiff && (!existing.updatedAt || remoteUpdated >= localUpdated)) {
+        eventMap.set(row.eventKey, {
+          ...existing,
+          name: row.name || existing.name,
+          eventCategory: row.eventCategory ?? existing.eventCategory,
+          target: row.target ?? existing.target,
+          date: normalizedDate,
+          time: row.time !== undefined ? row.time : existing.time,
+          calendarDisplay:
+            row.calendarDisplay !== undefined
+              ? row.calendarDisplay
+              : existing.calendarDisplay,
+          notes: row.notes !== undefined ? row.notes : existing.notes,
+          updatedAt: remoteUpdated || nowIso,
+        });
+        updatedEventCount++;
+      }
+    } else if (row.name) {
+      eventMap.set(row.eventKey, {
+        eventKey: row.eventKey,
+        name: row.name,
+        eventCategory: row.eventCategory ?? 'OFFICIAL',
+        target: row.target ?? 'ALL',
+        date: normalizedDate,
+        time: row.time ?? null,
+        reminderDays: [14, 7, 3, 0],
+        calendarDisplay: row.calendarDisplay ?? true,
+        notes: row.notes ?? '',
+        updatedAt: row.updatedAt || nowIso,
+      });
+      updatedEventCount++;
+    }
+  }
+
+  const mergedEvents = Array.from(eventMap.values());
+  const taskMap = new Map(params.roadmapTasks.map((t) => [t.taskId, t]));
+  const remoteProgMap = new Map(
+    params.remoteProgressRows.map((r) => [
+      r.progressId || `${r.studentId}_${r.taskId}`,
+      r,
+    ])
+  );
+
+  let updatedProgressCount = 0;
+
+  const mergedProgress = params.localProgress.map((rec) => {
+    const task = taskMap.get(rec.taskId);
+    const recomputedCommonDue = task
+      ? calculateCommonDueDate(task, mergedEvents)
+      : rec.commonDueDate;
+
+    const remoteRow = remoteProgMap.get(rec.progressId);
+    let nextStatus = rec.status;
+    let nextPersonalDate = rec.personalTargetDate;
+    let nextComment = rec.comment;
+    let nextUpdatedAt = rec.updatedAt;
+
+    if (remoteRow) {
+      const normalizedPersonal = isValidDateString(remoteRow.personalTargetDate)
+        ? remoteRow.personalTargetDate
+        : null;
+      const validStatus: ProgressStatus = [
+        'NOT_STARTED',
+        'IN_PROGRESS',
+        'COMPLETED',
+        'ON_HOLD',
+      ].includes(remoteRow.status)
+        ? remoteRow.status
+        : rec.status;
+
+      const hasDiff =
+        rec.status !== validStatus ||
+        rec.personalTargetDate !== normalizedPersonal ||
+        rec.comment !== (remoteRow.comment ?? rec.comment);
+
+      const remoteUpdated = remoteRow.updatedAt ?? '';
+      if (hasDiff && (!remoteUpdated || remoteUpdated >= rec.updatedAt)) {
+        nextStatus = validStatus;
+        nextPersonalDate = normalizedPersonal;
+        nextComment = remoteRow.comment ?? rec.comment;
+        nextUpdatedAt = remoteUpdated || nowIso;
+        updatedProgressCount++;
+      }
+    }
+
+    const { appliedDueDate, dueSource } = resolveAppliedDueDate(
+      nextPersonalDate,
+      recomputedCommonDue
+    );
+
+    let completedAt = rec.completedAt;
+    if (nextStatus === 'COMPLETED' && !completedAt) {
+      completedAt = nextUpdatedAt;
+    } else if (nextStatus !== 'COMPLETED') {
+      completedAt = null;
+    }
+
+    return {
+      ...rec,
+      status: nextStatus,
+      personalTargetDate: nextPersonalDate,
+      commonDueDate: recomputedCommonDue,
+      appliedDueDate,
+      dueSource,
+      completedAt,
+      comment: nextComment,
+      updatedAt: nextUpdatedAt,
+    };
+  });
+
+  return {
+    mergedEvents,
+    mergedProgress,
+    updatedEventCount,
+    updatedProgressCount,
+  };
+}
+
+

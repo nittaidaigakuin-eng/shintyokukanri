@@ -50,9 +50,12 @@ import {
   calculateCommonDueDate,
   getTokyoDateString,
   mergeBidirectionalCalendarEvents,
+  mergeBidirectionalSpreadsheetData,
   promoteStudentToM2,
   resolveAppliedDueDate,
   type ExternalGoogleCalendarEvent,
+  type ExternalSpreadsheetEventRow,
+  type ExternalSpreadsheetProgressRow,
 } from './lib/progressUtils';
 import {
   getActiveFirebaseConfig,
@@ -1205,6 +1208,173 @@ export const App: React.FC = () => {
     return `Googleカレンダー取込用ファイル (lab_schedule_${year}.ics: ${validEvents.length}件) を出力しました。「メール通知・送信」タブでGAS Webhook URLを設定すると、ボタン1つで自動双方向同期が動作します。`;
   };
 
+  // スプレッドシート ⇄ Webアプリ 双方向同期（シート自動生成・日付や進捗の相互修正）
+  const handleSyncGoogleSpreadsheetBidirectional = async (
+    year: number
+  ): Promise<string> => {
+    if (!currentUser?.roles.admin) return '管理者権限が必要です。';
+    const nowIso = new Date().toISOString();
+    const targetYearObj = academicYearsMap[year];
+    if (!targetYearObj) return '対象年度が見つかりません。';
+
+    const studentNameMap = new Map(students.map((s) => [s.studentId, s.name]));
+    const webhookUrl = operationConfig.gasBridgeWebhookUrl.trim();
+
+    if (webhookUrl) {
+      try {
+        // Step 1: スプレッドシート側の最新行データを取得
+        const pullRes = await fetch(webhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({
+            action: 'SYNC_SPREADSHEET_BIDIRECTIONAL',
+            spreadsheetUrl: operationConfig.googleSpreadsheetUrl ?? '',
+            writeBack: false,
+          }),
+        });
+        const pullData = (await pullRes.json()) as {
+          ok?: boolean;
+          spreadsheetUrl?: string;
+          remoteEventRows?: ExternalSpreadsheetEventRow[];
+          remoteProgressRows?: ExternalSpreadsheetProgressRow[];
+          error?: string;
+        };
+
+        if (!pullData.ok) {
+          return `スプレッドシート同期エラー: ${pullData.error ?? '不明なエラー'}`;
+        }
+
+        // Step 2: スプレッドシート側で修正された日付・ステータス・コメントをWebアプリ側へ双方向マージ
+        const {
+          mergedEvents,
+          mergedProgress,
+          updatedEventCount,
+          updatedProgressCount,
+        } = mergeBidirectionalSpreadsheetData({
+          localEvents: targetYearObj.events,
+          localProgress: progressRecords,
+          roadmapTasks,
+          remoteEventRows: pullData.remoteEventRows ?? [],
+          remoteProgressRows: pullData.remoteProgressRows ?? [],
+          nowIso,
+        });
+
+        // Step 3: マージ後の最新データをスプレッドシートの連携シートへ整形書き戻し
+        await fetch(webhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({
+            action: 'SYNC_SPREADSHEET_BIDIRECTIONAL',
+            spreadsheetUrl:
+              operationConfig.googleSpreadsheetUrl ||
+              pullData.spreadsheetUrl ||
+              '',
+            writeBack: true,
+            events: mergedEvents,
+            progressRows: mergedProgress.map((p) => ({
+              ...p,
+              studentName: studentNameMap.get(p.studentId) ?? p.studentId,
+            })),
+          }),
+        });
+
+        const nextYears = {
+          ...academicYearsMap,
+          [year]: {
+            ...targetYearObj,
+            updatedAt: nowIso,
+            events: mergedEvents,
+          },
+        };
+
+        const nextConfig: LabOperationConfig =
+          pullData.spreadsheetUrl && !operationConfig.googleSpreadsheetUrl
+            ? {
+                ...operationConfig,
+                googleSpreadsheetUrl: pullData.spreadsheetUrl,
+                updatedAt: nowIso,
+              }
+            : operationConfig;
+
+        const nextAudit: AuditLog[] = [
+          {
+            auditId: `audit-${Date.now()}`,
+            action: 'SYNC_GOOGLE_SPREADSHEET',
+            actorUid: currentUser.uid,
+            actorEmail: currentUser.email,
+            targetType: 'academicYear',
+            targetId: String(year),
+            details: {
+              updatedEventCount,
+              updatedProgressCount,
+              totalEvents: mergedEvents.length,
+              totalProgress: mergedProgress.length,
+            },
+            createdAt: nowIso,
+          },
+          ...auditLogs,
+        ];
+
+        setAcademicYearsMap(nextYears);
+        setProgressRecords(mergedProgress);
+        setOperationConfig(nextConfig);
+        setAuditLogs(nextAudit);
+        syncToCloud({
+          academicYearsMap: nextYears,
+          progressRecords: mergedProgress,
+          operationConfig: nextConfig,
+          auditLogs: nextAudit,
+        });
+
+        return `スプレッドシート双方向同期が完了しました（シートから日付更新反映: イベント${updatedEventCount}件・学生進捗${updatedProgressCount}件 / シート自動整形完了）。`;
+      } catch (err) {
+        return `スプレッドシートGAS通信に失敗しました: ${String(err)}`;
+      }
+    }
+
+    // GAS Webhook未設定時はスプレッドシートに直接貼り付け・インポート可能なCSVファイル（BOM付きUTF-8）を即時出力
+    const csvRows = [
+      [
+        'イベントキー',
+        '区分',
+        '予定・イベント名',
+        '対象',
+        '日付(YYYY-MM-DD)',
+        '時刻',
+        'Calendar同期',
+        '備考',
+      ].join(','),
+      ...targetYearObj.events.map((ev) =>
+        [
+          ev.eventKey,
+          ev.eventCategory ?? 'OFFICIAL',
+          `"${(ev.name || '').replace(/"/g, '""')}"`,
+          ev.target,
+          ev.date ?? '',
+          ev.time ?? '',
+          ev.calendarDisplay,
+          `"${(ev.notes || '').replace(/"/g, '""')}"`,
+        ].join(',')
+      ),
+    ];
+
+    try {
+      const blob = new Blob(['\uFEFF' + csvRows.join('\r\n')], {
+        type: 'text/csv;charset=utf-8',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `lab_spreadsheet_sync_${year}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      // ignore in headless test environments
+    }
+
+    return `スプレッドシート連携用CSV (lab_spreadsheet_sync_${year}.csv) を出力しました。「メール通知・送信」タブでスプレッドシートのApps Script URLを設定すると、ボタン1つでシート自動生成＆双方向同期が動作します。`;
+  };
+
   // ⑤ リマインドメール送信機能の確立（GAS Webhook 自動送信 ＋ メーラー即時送信フォールバック）
   const handleSendReminderEmail = async (params: {
     notificationId: string;
@@ -1720,6 +1890,9 @@ export const App: React.FC = () => {
             onDeleteAcademicEvent={handleDeleteAcademicEvent}
             onSyncGoogleCalendarBidirectional={
               handleSyncGoogleCalendarBidirectional
+            }
+            onSyncGoogleSpreadsheetBidirectional={
+              handleSyncGoogleSpreadsheetBidirectional
             }
             onSendReminderEmail={handleSendReminderEmail}
             onUpdateOperationConfig={handleUpdateOperationConfig}

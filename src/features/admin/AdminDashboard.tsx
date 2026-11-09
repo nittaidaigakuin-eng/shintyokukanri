@@ -151,6 +151,7 @@ interface AdminDashboardProps {
   ) => void;
   onDeleteAcademicEvent: (year: number, eventKey: string) => void;
   onSyncGoogleCalendarBidirectional: (year: number) => Promise<string>;
+  onSyncGoogleSpreadsheetBidirectional: (year: number) => Promise<string>;
   onAddRoadmapTask: (input: {
     grade: MasterGrade;
     category: string;
@@ -204,6 +205,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   onAddAcademicEvent,
   onDeleteAcademicEvent,
   onSyncGoogleCalendarBidirectional,
+  onSyncGoogleSpreadsheetBidirectional,
   onAddRoadmapTask,
   onUpdateRoadmapTask,
   onDeleteRoadmapTask,
@@ -255,6 +257,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [newEvTime, setNewEvTime] = useState('10:00');
   const [newEvNotes, setNewEvNotes] = useState('');
   const [syncingCalendar, setSyncingCalendar] = useState(false);
+  const [syncingSpreadsheet, setSyncingSpreadsheet] = useState(false);
 
   // タスク追加・編集モーダル用
   const [roadmapGradeFilter, setRoadmapGradeFilter] = useState<
@@ -1470,6 +1473,30 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   />
                   Googleカレンダー双方向同期
                 </button>
+
+                <button
+                  type="button"
+                  disabled={syncingSpreadsheet}
+                  onClick={async () => {
+                    setSyncingSpreadsheet(true);
+                    try {
+                      const msg = await onSyncGoogleSpreadsheetBidirectional(
+                        selectedAcademicYear
+                      );
+                      setBannerMessage(msg);
+                    } finally {
+                      setSyncingSpreadsheet(false);
+                    }
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-700 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-800 disabled:opacity-50"
+                >
+                  <FileSpreadsheet
+                    className={`h-3.5 w-3.5 ${
+                      syncingSpreadsheet ? 'animate-spin' : ''
+                    }`}
+                  />
+                  スプレッドシート双方向同期（日付・進捗）
+                </button>
               </div>
             </div>
 
@@ -1807,29 +1834,61 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               </button>
             </div>
 
-            {/* GAS Webhook URL 設定欄 */}
-            <div className="mt-4 rounded-xl border border-blue-200 bg-blue-50/40 p-4 text-xs">
-              <label className="block font-bold text-[#0B1F3A]">
-                メール自動送信 & Googleカレンダー双方向同期ブリッジ URL（任意・設定するとワンクリック自動送信になります）
-              </label>
-              <div className="mt-2 flex flex-col gap-2 sm:flex-row">
-                <input
-                  type="url"
-                  value={operationConfig.gasBridgeWebhookUrl}
-                  onChange={(e) =>
-                    onUpdateOperationConfig({
-                      gasBridgeWebhookUrl: e.target.value.trim(),
-                    })
-                  }
-                  placeholder="https://script.google.com/macros/s/xxxxxx/exec"
-                  className="flex-1 rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs"
-                />
-                <span className="inline-flex items-center rounded-xl bg-white px-3 py-2 font-semibold text-slate-700">
-                  状態:{' '}
-                  {operationConfig.gasBridgeWebhookUrl
-                    ? '✅ GAS自動送信ブリッジ接続済'
-                    : 'メーラー起動 / ローカル記録モード'}
-                </span>
+            {/* GAS Webhook URL & スプレッドシートURL 設定欄 */}
+            <div className="mt-4 space-y-3 rounded-xl border border-blue-200 bg-blue-50/40 p-4 text-xs">
+              <div>
+                <label className="block font-bold text-[#0B1F3A]">
+                  ① メール自動送信 & Googleカレンダー & スプレッドシート双方向同期ブリッジ URL（GAS WebアプリURL）
+                </label>
+                <div className="mt-1.5 flex flex-col gap-2 sm:flex-row">
+                  <input
+                    type="url"
+                    value={operationConfig.gasBridgeWebhookUrl}
+                    onChange={(e) =>
+                      onUpdateOperationConfig({
+                        gasBridgeWebhookUrl: e.target.value.trim(),
+                      })
+                    }
+                    placeholder="https://script.google.com/macros/s/xxxxxx/exec"
+                    className="flex-1 rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs"
+                  />
+                  <span className="inline-flex items-center rounded-xl bg-white px-3 py-2 font-semibold text-slate-700">
+                    状態:{' '}
+                    {operationConfig.gasBridgeWebhookUrl
+                      ? '✅ GAS自動連携ブリッジ接続済'
+                      : 'メーラー起動 / CSV・ICS出力モード'}
+                  </span>
+                </div>
+              </div>
+
+              <div>
+                <label className="block font-bold text-[#0B1F3A]">
+                  ② 連携先GoogleスプレッドシートURL（先に作成していたスプレッドシートのURLを貼ると、連携用シートを自動生成・双方向同期します）
+                </label>
+                <div className="mt-1.5 flex flex-col gap-2 sm:flex-row">
+                  <input
+                    type="url"
+                    value={operationConfig.googleSpreadsheetUrl ?? ''}
+                    onChange={(e) =>
+                      onUpdateOperationConfig({
+                        googleSpreadsheetUrl: e.target.value.trim(),
+                      })
+                    }
+                    placeholder="https://docs.google.com/spreadsheets/d/xxxxxx/edit"
+                    className="flex-1 rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs"
+                  />
+                  {operationConfig.googleSpreadsheetUrl && (
+                    <a
+                      href={operationConfig.googleSpreadsheetUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1 rounded-xl bg-emerald-700 px-3.5 py-2 font-semibold text-white hover:bg-emerald-800"
+                    >
+                      <ArrowUpRight className="h-3.5 w-3.5" />
+                      スプレッドシートを開く
+                    </a>
+                  )}
+                </div>
               </div>
             </div>
 

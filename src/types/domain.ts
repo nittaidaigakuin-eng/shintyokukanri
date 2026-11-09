@@ -197,7 +197,8 @@ export interface LabOperationConfig {
   updateTimingRule: string; // 学生が進捗を更新するタイミング（例：毎週のゼミ前日までに更新）
   reviewMethodRule: string; // 研究室全体での進捗確認方法（例：週次ゼミ冒頭で「研究室メンバーの進捗」画面を共有）
   googleCalendarId: string; // 連携先GoogleカレンダーID (例: nittai.daigakuin@gmail.com)
-  gasBridgeWebhookUrl: string; // メール送信＆Googleカレンダー双方向同期用GAS WebアプリURL
+  googleSpreadsheetUrl?: string; // 連携先GoogleスプレッドシートURL（既存スプレッドシートに連携用シートを自動生成・双方向同期）
+  gasBridgeWebhookUrl: string; // メール送信＆Googleカレンダー＆スプレッドシート双方向同期用GAS WebアプリURL
   updatedAt: string;
 }
 
@@ -245,6 +246,7 @@ export type AuditAction =
   | 'ADMIN_UPDATE_PROGRESS'
   | 'SEND_REMINDER_EMAIL'
   | 'SYNC_GOOGLE_CALENDAR'
+  | 'SYNC_GOOGLE_SPREADSHEET'
   | 'UPDATE_OPERATION_CONFIG';
 
 export interface AuditLog {

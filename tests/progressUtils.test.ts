@@ -21,6 +21,7 @@ import {
   evaluateDeadlineState,
   getPreviousMonday,
   mergeBidirectionalCalendarEvents,
+  mergeBidirectionalSpreadsheetData,
   promoteStudentToM2,
   resolveAppliedDueDate,
   shouldSendNotification,
@@ -300,5 +301,77 @@ describe('Notification & Calendar Deduplication (#60, #67, #68)', () => {
     expect(res.mergedEvents[0].date).toBe('2026-07-25');
     expect(res.mergedEvents[1].eventCategory).toBe('CLASS');
     expect(res.mergedEvents[1].syncOrigin).toBe('GOOGLE_CALENDAR');
+  });
+
+  it('merges bidirectional Google Spreadsheet edits (event dates & student progress) and recalculates common due dates', () => {
+    const localEvents = [
+      {
+        eventKey: 'M2_MIDTERM_PRESENTATION',
+        name: 'M2中間発表日',
+        eventCategory: 'OFFICIAL' as const,
+        target: 'M2' as const,
+        date: '2026-07-18',
+        time: '09:00',
+        reminderDays: [14, 7, 3, 0],
+        calendarDisplay: true,
+        notes: '初期',
+        updatedAt: '2026-04-01T00:00:00.000Z',
+      },
+    ];
+    const localProgress: ProgressRecord[] = [
+      {
+        progressId: 'S001_M2-08',
+        studentId: 'S001',
+        taskId: 'M2-08',
+        historicalGrade: 'M2',
+        category: '04_中間発表',
+        title: '中間発表抄録（要旨）の提出',
+        displayOrder: 8,
+        progressManaged: true,
+        personalTargetDate: null,
+        commonDueDate: '2026-07-13',
+        appliedDueDate: '2026-07-13',
+        dueSource: 'COMMON',
+        status: 'NOT_STARTED',
+        completedAt: null,
+        comment: '',
+        updatedAt: '2026-04-01T00:00:00.000Z',
+        updatedByUid: 'uid-admin',
+      },
+    ];
+
+    const res = mergeBidirectionalSpreadsheetData({
+      localEvents,
+      localProgress,
+      roadmapTasks: INITIAL_ROADMAP_TASKS,
+      remoteEventRows: [
+        {
+          eventKey: 'M2_MIDTERM_PRESENTATION',
+          name: 'M2中間発表日',
+          date: '2026-07-25', // Saturday -> previous Monday is 2026-07-20
+          updatedAt: '2026-05-01T00:00:00.000Z',
+        },
+      ],
+      remoteProgressRows: [
+        {
+          progressId: 'S001_M2-08',
+          studentId: 'S001',
+          taskId: 'M2-08',
+          status: 'IN_PROGRESS',
+          personalTargetDate: '2026-07-15',
+          comment: 'スプレッドシート上で目標日を設定',
+          updatedAt: '2026-05-01T00:00:00.000Z',
+        },
+      ],
+      nowIso: '2026-05-02T00:00:00.000Z',
+    });
+
+    expect(res.updatedEventCount).toBe(1);
+    expect(res.updatedProgressCount).toBe(1);
+    expect(res.mergedEvents[0].date).toBe('2026-07-25');
+    expect(res.mergedProgress[0].commonDueDate).toBe('2026-07-20');
+    expect(res.mergedProgress[0].personalTargetDate).toBe('2026-07-15');
+    expect(res.mergedProgress[0].appliedDueDate).toBe('2026-07-15');
+    expect(res.mergedProgress[0].status).toBe('IN_PROGRESS');
   });
 });
