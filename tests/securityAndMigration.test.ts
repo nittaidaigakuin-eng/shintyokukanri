@@ -27,9 +27,11 @@ describe('Firestore Security Rules Deny-First Verification (#72, #73, #74, #95)'
     expect(rulesContent).not.toContain('allow read, write: if true');
   });
 
-  it('restricts student data access to their own studentId via Custom Claims', () => {
+  it('allows lab students to read peer progress while strictly locking updates to their own studentId', () => {
     expect(rulesContent).toContain('request.auth.token.studentId == studentId');
     expect(rulesContent).toContain('request.auth.token.admin == true');
+    expect(rulesContent).toContain('allow read: if isAdmin() || isStudent();');
+    expect(rulesContent).toContain('isOwnStudentId(resource.data.studentId)');
   });
 
   it('prevents students from mutating historicalGrade, studentId, taskId, or roles', () => {

@@ -1,6 +1,6 @@
 /**
- * 管理者画面（ダッシュボード・問題学生抽出・学生一覧・在籍状態変更・学生詳細・新規登録・年度別設定・ロードマップ追加/削除/編集・リマインド通知・監査ログ）
- * MASTER_SPEC.md #45〜#53, #57〜#71 に完全準拠
+ * 管理者画面（ダッシュボード・問題学生抽出・学生一覧・兼務権限切替・在籍変更・年度＆カレンダー双方向連携・ロードマップ増減・メール送信・研究プロセス履歴・管理体制設定）
+ * MASTER_SPEC.md および研究室からの追加意見（①〜④＋メール送信機能の確立）に完全準拠
  */
 
 import React, { useMemo, useState } from 'react';
@@ -8,16 +8,21 @@ import {
   AlertTriangle,
   ArrowUpRight,
   Bell,
+  BookOpen,
   Calendar,
   Clock,
   Cloud,
+  Copy,
   Edit3,
   FileSpreadsheet,
   KeyRound,
-  Mail,
   Plus,
+  RefreshCw,
   Search,
+  Send,
+  Settings,
   ShieldAlert,
+  ShieldCheck,
   Trash2,
   UserCheck,
   UserPlus,
@@ -31,21 +36,32 @@ import type {
   DeadlineRule,
   DeadlineType,
   EnrollmentStatus,
+  LabOperationConfig,
   MasterGrade,
+  NotificationLog,
   ProgressRecord,
   ProgressStatus,
+  ResearchProcessLogEntry,
   RoadmapTask,
+  ScheduleEventCategory,
   Student,
   UserProfile,
 } from '../../types/domain';
-import { PROGRESS_STATUS_LABELS } from '../../types/domain';
+import {
+  PROGRESS_STATUS_LABELS,
+  SCHEDULE_EVENT_CATEGORY_LABELS,
+} from '../../types/domain';
 import {
   buildNotificationId,
   calculateGradeProgressSummary,
   calculateRemainingDays,
   evaluateDeadlineState,
+  shouldSendNotification,
 } from '../../lib/progressUtils';
-import { SYSTEM_REMINDER_SENDER_EMAIL } from '../../data/demoSeed';
+import {
+  GAS_EMAIL_AND_CALENDAR_BRIDGE_CODE,
+  SYSTEM_REMINDER_SENDER_EMAIL,
+} from '../../data/demoSeed';
 import { DeadlineBadge, StatusBadge } from '../../components/Badges';
 import {
   getActiveFirebaseConfig,
@@ -59,15 +75,20 @@ type AdminSubTab =
   | 'ACADEMIC_YEAR'
   | 'ROADMAP'
   | 'NOTIFICATIONS'
+  | 'PROCESS_LOGS'
+  | 'OPERATION_POLICY'
   | 'AUDIT';
 
 interface AdminDashboardProps {
   students: Student[];
   userProfiles: UserProfile[];
   progressRecords: ProgressRecord[];
+  processLogs: ResearchProcessLogEntry[];
+  notificationLogs: NotificationLog[];
   roadmapTasks: RoadmapTask[];
   academicYearsMap: Record<number, AcademicYear>;
   selectedAcademicYear: number;
+  operationConfig: LabOperationConfig;
   auditLogs: AuditLog[];
   todayTokyo: string;
   isCloudConnected: boolean;
@@ -99,6 +120,7 @@ interface AdminDashboardProps {
       >
     >
   ) => void;
+  onToggleStudentAdminRole: (studentId: string, isAdminAlso: boolean) => void;
   onPromoteToM2: (studentId: string) => void;
   onToggleAccountActive: (studentId: string, active: boolean) => void;
   onResetPassword: (studentId: string, tempPassword: string) => Promise<void>;
@@ -115,6 +137,20 @@ interface AdminDashboardProps {
     eventKey: string,
     updates: Partial<AcademicEvent>
   ) => void;
+  onAddAcademicEvent: (
+    year: number,
+    input: {
+      name: string;
+      eventCategory: ScheduleEventCategory;
+      target: MasterGrade | 'ALL';
+      date: string;
+      time: string | null;
+      calendarDisplay: boolean;
+      notes: string;
+    }
+  ) => void;
+  onDeleteAcademicEvent: (year: number, eventKey: string) => void;
+  onSyncGoogleCalendarBidirectional: (year: number) => Promise<string>;
   onAddRoadmapTask: (input: {
     grade: MasterGrade;
     category: string;
@@ -128,15 +164,30 @@ interface AdminDashboardProps {
   }) => void;
   onUpdateRoadmapTask: (taskId: string, updates: Partial<RoadmapTask>) => void;
   onDeleteRoadmapTask: (taskId: string) => void;
+  onSendReminderEmail: (params: {
+    notificationId: string;
+    progressId: string;
+    studentId: string;
+    studentName: string;
+    recipientEmail: string;
+    taskId: string;
+    taskTitle: string;
+    dueDate: string;
+    remindDays: number;
+  }) => Promise<{ ok: boolean; mode: 'GAS_WEBHOOK' | 'MAILTO'; message: string }>;
+  onUpdateOperationConfig: (updates: Partial<LabOperationConfig>) => void;
 }
 
 export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   students,
   userProfiles,
   progressRecords,
+  processLogs,
+  notificationLogs,
   roadmapTasks,
   academicYearsMap,
   selectedAcademicYear,
+  operationConfig,
   auditLogs,
   todayTokyo,
   isCloudConnected,
@@ -144,14 +195,20 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   onAddAcademicYear,
   onCreateStudent,
   onUpdateStudentMeta,
+  onToggleStudentAdminRole,
   onPromoteToM2,
   onToggleAccountActive,
   onResetPassword,
   onAdminUpdateProgress,
   onUpdateAcademicEvent,
+  onAddAcademicEvent,
+  onDeleteAcademicEvent,
+  onSyncGoogleCalendarBidirectional,
   onAddRoadmapTask,
   onUpdateRoadmapTask,
   onDeleteRoadmapTask,
+  onSendReminderEmail,
+  onUpdateOperationConfig,
 }) => {
   const [subTab, setSubTab] = useState<AdminSubTab>('OVERVIEW');
   const [selectedStudentId, setSelectedStudentId] = useState<string | null>(
@@ -185,10 +242,19 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [newIsAdminAlso, setNewIsAdminAlso] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
 
-  // 年度追加用
+  // 年度追加・スケジュール予定追加用
   const [newYearInput, setNewYearInput] = useState<number>(
     selectedAcademicYear + 1
   );
+  const [showAddEventModal, setShowAddEventModal] = useState(false);
+  const [newEvName, setNewEvName] = useState('');
+  const [newEvCategory, setNewEvCategory] =
+    useState<ScheduleEventCategory>('LAB_EVENT');
+  const [newEvTarget, setNewEvTarget] = useState<MasterGrade | 'ALL'>('ALL');
+  const [newEvDate, setNewEvDate] = useState(todayTokyo);
+  const [newEvTime, setNewEvTime] = useState('10:00');
+  const [newEvNotes, setNewEvNotes] = useState('');
+  const [syncingCalendar, setSyncingCalendar] = useState(false);
 
   // タスク追加・編集モーダル用
   const [roadmapGradeFilter, setRoadmapGradeFilter] = useState<
@@ -212,6 +278,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [editTaskCategory, setEditTaskCategory] = useState('');
   const [editTaskAction, setEditTaskAction] = useState('');
   const [editTaskGuideline, setEditTaskGuideline] = useState('');
+
+  // GASブリッジコード表示用
+  const [showGasScriptModal, setShowGasScriptModal] = useState(false);
 
   // Firebaseクラウド接続モーダル用
   const [showCloudModal, setShowCloudModal] = useState(false);
@@ -439,7 +508,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     searchQuery,
   ]);
 
-  // 学生別リマインド通知プレビュー計算 (#57〜#62)
+  // ⑤ 学生別リマインド通知キュー計算 (#57〜#62)
   const studentNotificationQueue = useMemo(() => {
     const taskMap = new Map(activeRoadmapTasks.map((t) => [t.taskId, t]));
     const items: Array<{
@@ -448,6 +517,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       record: ProgressRecord;
       remainingDays: number;
       isTriggerDay: boolean;
+      alreadySent: boolean;
     }> = [];
 
     for (const student of students) {
@@ -472,23 +542,32 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         const pattern = task?.reminderPattern ?? [14, 7, 3, 0];
         const isTriggerDay = pattern.includes(rem);
         if (rem <= 14) {
+          const notifId = buildNotificationId(
+            student.studentId,
+            rec.taskId,
+            rec.appliedDueDate!,
+            rem
+          );
+          const canSend = shouldSendNotification(notifId, notificationLogs);
           items.push({
-            notificationId: buildNotificationId(
-              student.studentId,
-              rec.taskId,
-              rec.appliedDueDate!,
-              rem
-            ),
+            notificationId: notifId,
             student,
             record: rec,
             remainingDays: rem,
             isTriggerDay,
+            alreadySent: !canSend,
           });
         }
       }
     }
     return items.sort((a, b) => a.remainingDays - b.remainingDays);
-  }, [students, progressRecords, activeRoadmapTasks, todayTokyo]);
+  }, [
+    students,
+    progressRecords,
+    activeRoadmapTasks,
+    notificationLogs,
+    todayTokyo,
+  ]);
 
   const openStudentDetail = (studentId: string) => {
     setSelectedStudentId(studentId);
@@ -529,6 +608,26 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     setNewName('');
     setNewEmail('');
     setNewInitialPassword('');
+  };
+
+  const handleAddEventSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newEvName.trim() || !newEvDate) return;
+    onAddAcademicEvent(selectedAcademicYear, {
+      name: newEvName.trim(),
+      eventCategory: newEvCategory,
+      target: newEvTarget,
+      date: newEvDate,
+      time: newEvTime || null,
+      calendarDisplay: true,
+      notes: newEvNotes.trim(),
+    });
+    setShowAddEventModal(false);
+    setBannerMessage(
+      `${selectedAcademicYear}年度スケジュールに「${newEvName} (${SCHEDULE_EVENT_CATEGORY_LABELS[newEvCategory]})」を追加しました。`
+    );
+    setNewEvName('');
+    setNewEvNotes('');
   };
 
   const handleAddTaskSubmit = (e: React.FormEvent) => {
@@ -603,13 +702,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           {(
             [
               ['OVERVIEW', '要対応・ダッシュボード'],
-              ['STUDENTS', `学生一覧 (${students.length}名)`],
-              ['ACADEMIC_YEAR', `年度別設定 (${selectedAcademicYear}年度)`],
+              ['STUDENTS', `学生一覧・管理権限 (${students.length}名)`],
               [
-                'ROADMAP',
-                `ロードマップ管理 (${activeRoadmapTasks.length}件)`,
+                'ACADEMIC_YEAR',
+                `年間スケジュール・Calendar (${selectedAcademicYear}年度)`,
               ],
-              ['NOTIFICATIONS', '通知・リマインド設定'],
+              ['ROADMAP', `ロードマップ管理 (${activeRoadmapTasks.length}件)`],
+              ['NOTIFICATIONS', 'メール送信・リマインド管理'],
+              ['PROCESS_LOGS', `研究プロセス履歴 (${processLogs.length}件)`],
+              ['OPERATION_POLICY', '管理体制・運用ルール'],
               ['AUDIT', '監査ログ'],
             ] as Array<[AdminSubTab, string]>
           ).map(([tabKey, label]) => (
@@ -617,7 +718,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               key={tabKey}
               type="button"
               onClick={() => setSubTab(tabKey)}
-              className={`rounded-xl px-3.5 py-2 text-xs font-bold transition ${
+              className={`rounded-xl px-3 py-2 text-xs font-bold transition ${
                 subTab === tabKey ||
                 (subTab === 'STUDENT_DETAIL' && tabKey === 'STUDENTS')
                   ? 'bg-[#0B1F3A] text-white'
@@ -642,7 +743,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             <Cloud className="h-3.5 w-3.5" />
             {isCloudConnected
               ? 'Firebaseクラウド同期中'
-              : '同一端末保存モード（クラウド接続設定）'}
+              : 'クラウド接続設定'}
           </button>
 
           <button
@@ -674,6 +775,33 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
          ===================================================================== */}
       {subTab === 'OVERVIEW' && (
         <div className="space-y-6">
+          {/* 来年度管理体制・運用ルールサマリーバー (②・④対応) */}
+          <div className="flex flex-col justify-between gap-3 rounded-2xl border border-blue-200 bg-blue-50/50 p-4 text-xs sm:flex-row sm:items-center">
+            <div className="space-y-1">
+              <div className="flex flex-wrap items-center gap-3 font-bold text-[#0B1F3A]">
+                <span>
+                  【運用・管理体制】主管理: {operationConfig.primaryAdminName}
+                </span>
+                <span>/</span>
+                <span>
+                  学生管理・運用担当: {operationConfig.studentAdminNames}
+                </span>
+              </div>
+              <p className="text-slate-600">
+                進捗更新ルール: {operationConfig.updateTimingRule} ／ 全体確認:{' '}
+                {operationConfig.reviewMethodRule}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setSubTab('OPERATION_POLICY')}
+              className="inline-flex shrink-0 items-center gap-1 rounded-xl border border-blue-600 bg-white px-3 py-1.5 font-semibold text-blue-600 hover:bg-blue-50"
+            >
+              <Settings className="h-3.5 w-3.5" />
+              管理体制・役割分担を編集
+            </button>
+          </div>
+
           {/* 主要4指標カード */}
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
             <button
@@ -800,7 +928,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   まだ学生が登録されていません
                 </p>
                 <p className="mt-1 text-xs text-slate-500">
-                  右上の「新規学生登録」ボタンから学生アカウントを作成してください。
+                  右上の「新規学生登録」ボタンから学生アカウント（例：菊水さん、立山さん等）を作成してください。
                 </p>
                 <button
                   type="button"
@@ -878,7 +1006,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             )}
           </div>
 
-          {/* 学年別進捗 & 次の公式イベント (#46) */}
+          {/* 学年別進捗 & 次の公式イベント・行事 (#46) */}
           <div className="grid grid-cols-1 gap-5 lg:grid-cols-12">
             <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs lg:col-span-5">
               <h3 className="text-sm font-bold text-[#0B1F3A]">
@@ -920,7 +1048,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <h3 className="text-sm font-bold text-[#0B1F3A]">
-                    {selectedAcademicYear}年度 公式イベント（Source of Truth）
+                    {selectedAcademicYear}年度 スケジュール（研究・授業・研究室行事）
                   </h3>
                   <select
                     value={selectedAcademicYear}
@@ -941,35 +1069,41 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   onClick={() => setSubTab('ACADEMIC_YEAR')}
                   className="text-xs font-semibold text-blue-600 hover:underline"
                 >
-                  年度別日程を編集 →
+                  予定追加・双方向同期 →
                 </button>
               </div>
               <div className="mt-3 divide-y divide-slate-100">
-                {academicEvents.map((ev) => (
-                  <div
-                    key={ev.eventKey}
-                    className="flex items-center justify-between py-2.5 text-xs"
-                  >
-                    <div className="flex items-center gap-2">
-                      <span className="rounded bg-slate-100 px-2 py-0.5 font-bold text-slate-700">
-                        {ev.target}
-                      </span>
-                      <span className="font-medium text-slate-900">
-                        {ev.name}
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <span className="font-semibold text-slate-800">
-                        {ev.date ?? '未定'} {ev.time ?? ''}
-                      </span>
-                      {ev.calendarDisplay && (
-                        <span className="rounded bg-blue-50 px-2 py-0.5 text-[11px] font-medium text-blue-700">
-                          Calendar同期対象
+                {academicEvents.map((ev) => {
+                  const cat = ev.eventCategory ?? 'OFFICIAL';
+                  return (
+                    <div
+                      key={ev.eventKey}
+                      className="flex items-center justify-between py-2.5 text-xs"
+                    >
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={`rounded px-2 py-0.5 text-[11px] font-bold ${
+                            cat === 'OFFICIAL'
+                              ? 'bg-[#0B1F3A] text-white'
+                              : cat === 'CLASS'
+                              ? 'bg-emerald-100 text-emerald-800'
+                              : 'bg-blue-100 text-blue-800'
+                          }`}
+                        >
+                          {SCHEDULE_EVENT_CATEGORY_LABELS[cat]}
                         </span>
-                      )}
+                        <span className="font-medium text-slate-900">
+                          {ev.name}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <span className="font-semibold text-slate-800">
+                          {ev.date ?? '未定'} {ev.time ?? ''}
+                        </span>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           </div>
@@ -977,16 +1111,21 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       )}
 
       {/* =====================================================================
-          TAB 2: 学生一覧・在籍状態変更・フィルタ・検索 (#23, #47, #48)
+          TAB 2: 学生一覧・在籍状態変更・学生管理担当（兼務）付与 (#23, #47, #48, ②対応)
          ===================================================================== */}
       {subTab === 'STUDENTS' && (
         <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs">
           <div className="flex flex-col justify-between gap-4 border-b border-slate-200 pb-4 lg:flex-row lg:items-center">
             <div className="flex items-center gap-2">
               <Users className="h-5 w-5 text-[#0B1F3A]" />
-              <h2 className="text-base font-bold text-[#0B1F3A]">
-                学生一覧（{filteredStudents.length}名）
-              </h2>
+              <div>
+                <h2 className="text-base font-bold text-[#0B1F3A]">
+                  学生一覧・管理担当（兼務）設定（{filteredStudents.length}名）
+                </h2>
+                <p className="text-xs text-slate-500">
+                  在籍状態（在籍/休学/修了/退学）の切り替えや、学生管理担当（兼務権限）の付与が一覧上でいつでも行えます。
+                </p>
+              </div>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
@@ -1075,17 +1214,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     <th className="px-3 py-3">氏名 / ID / 通知先メール</th>
                     <th className="px-3 py-3">学年</th>
                     <th className="px-3 py-3">在籍状態（変更可）</th>
+                    <th className="px-3 py-3">管理権限（②来年度担当等）</th>
                     <th className="px-3 py-3">進捗率</th>
                     <th className="px-3 py-3">次の期限</th>
-                    <th className="px-3 py-3">期限超過数</th>
                     <th className="px-3 py-3">最終更新</th>
-                    <th className="px-3 py-3">指導教員</th>
                     <th className="px-3 py-3 text-right">操作</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {filteredStudents.map((item) => {
-                    const { student, summary } = item;
+                    const { student, profile, summary } = item;
+                    const isStudentAdmin = Boolean(profile?.roles.admin);
                     return (
                       <tr
                         key={student.studentId}
@@ -1104,11 +1243,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                             {student.currentGrade}
                           </span>
                           <div className="mt-0.5 text-[11px] text-slate-500">
-                            {student.enrollmentYear}年度入学
+                            {student.enrollmentYear}年度
                           </div>
                         </td>
                         <td className="px-3 py-3.5">
-                          {/* 在籍・休学・修了・退学を一覧上でいつでも変更可能 */}
                           <select
                             value={student.enrollmentStatus}
                             onChange={(e) => {
@@ -1130,6 +1268,36 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           </select>
                         </td>
                         <td className="px-3 py-3.5">
+                          {/* ② 来年度の学生管理担当（兼務者）をワンクリックで切り替え可能 */}
+                          <label className="inline-flex cursor-pointer items-center gap-1.5">
+                            <input
+                              type="checkbox"
+                              checked={isStudentAdmin}
+                              onChange={(e) => {
+                                onToggleStudentAdminRole(
+                                  student.studentId,
+                                  e.target.checked
+                                );
+                                setBannerMessage(
+                                  `${student.name} の管理者兼務権限を「${
+                                    e.target.checked ? '有効（管理画面切替可）' : '一般学生のみ'
+                                  }」に変更しました。`
+                                );
+                              }}
+                              className="rounded border-slate-300 text-blue-600"
+                            />
+                            <span
+                              className={
+                                isStudentAdmin
+                                  ? 'font-bold text-blue-700'
+                                  : 'text-slate-500'
+                              }
+                            >
+                              {isStudentAdmin ? '管理担当 (兼務)' : '一般学生'}
+                            </span>
+                          </label>
+                        </td>
+                        <td className="px-3 py-3.5">
                           <div className="font-bold text-slate-900">
                             {summary.percentage}% (
                             {summary.completedManagedTasks}/
@@ -1148,7 +1316,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                               <div className="font-semibold text-slate-800">
                                 {item.nextDueDate}
                               </div>
-                              <div className="max-w-44 truncate text-[11px] text-slate-500">
+                              <div className="max-w-40 truncate text-[11px] text-slate-500">
                                 {item.nextDueTitle}
                               </div>
                             </div>
@@ -1156,21 +1324,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                             <span className="text-slate-400">未設定</span>
                           )}
                         </td>
-                        <td className="px-3 py-3.5">
-                          {summary.overdueTasks > 0 ? (
-                            <span className="inline-flex items-center gap-1 rounded-full bg-red-50 px-2.5 py-0.5 font-bold text-red-700">
-                              <AlertTriangle className="h-3.5 w-3.5" />
-                              {summary.overdueTasks}件
-                            </span>
-                          ) : (
-                            <span className="text-slate-500">0件</span>
-                          )}
-                        </td>
                         <td className="px-3 py-3.5 text-slate-600">
                           {student.updatedAt.slice(0, 16).replace('T', ' ')}
-                        </td>
-                        <td className="px-3 py-3.5 text-slate-700">
-                          {student.supervisor}
                         </td>
                         <td className="px-3 py-3.5 text-right">
                           <button
@@ -1192,7 +1347,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       )}
 
       {/* =====================================================================
-          TAB 3: 学生詳細（在籍状態変更・M1/M2進捗・M1→M2進級・PWリセット・無効化 #49, #52, #53）
+          TAB 3: 学生詳細
          ===================================================================== */}
       {subTab === 'STUDENT_DETAIL' && selectedDetail && (
         <StudentDetailPanel
@@ -1230,138 +1385,209 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       )}
 
       {/* =====================================================================
-          TAB 4: 年度別設定（年度切替・新規年度追加・共通公式予定更新 #29, #30, #63〜#68）
+          TAB 4: ③ 年間スケジュール・授業・研究室行事 ＆ Googleカレンダー双方向連携
          ===================================================================== */}
       {subTab === 'ACADEMIC_YEAR' && (
-        <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs">
-          <div className="flex flex-col justify-between gap-4 border-b border-slate-200 pb-4 lg:flex-row lg:items-center">
-            <div>
-              <h2 className="text-base font-bold text-[#0B1F3A]">
-                年度別 公式イベント設定（共通期限・Google Calendar Source of Truth）
-              </h2>
-              <p className="mt-1 text-xs text-slate-500">
-                年度ごとに公式イベント日程を管理できます。日程を更新すると、現在対象となるロードマップタスクの共通期限（直前月曜ルール含む）が自動再計算されます。
-              </p>
-            </div>
+        <div className="space-y-5">
+          <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs">
+            <div className="flex flex-col justify-between gap-4 border-b border-slate-200 pb-4 lg:flex-row lg:items-center">
+              <div>
+                <h2 className="text-base font-bold text-[#0B1F3A]">
+                  年間スケジュール一元管理（公式研究日程・授業・研究室行事）＆ Googleカレンダー双方向同期
+                </h2>
+                <p className="mt-1 text-xs text-slate-500">
+                  研究予定だけでなく、授業・ゼミや研究室行事も登録可能です。WebアプリとGoogleカレンダー（{operationConfig.googleCalendarId}）間で双方向に予定を同期できます。
+                </p>
+              </div>
 
-            {/* 年度切り替え・新規年度作成バー */}
-            <div className="flex flex-wrap items-center gap-2">
-              <label className="text-xs font-bold text-slate-700">
-                対象年度:
-              </label>
-              <select
-                value={selectedAcademicYear}
-                onChange={(e) => onSelectAcademicYear(Number(e.target.value))}
-                className="rounded-xl border border-slate-300 bg-slate-50 px-3 py-1.5 text-xs font-bold text-[#0B1F3A]"
-              >
-                {availableYears.map((y) => (
-                  <option key={y} value={y}>
-                    {y}年度
-                  </option>
-                ))}
-              </select>
+              <div className="flex flex-wrap items-center gap-2">
+                <select
+                  value={selectedAcademicYear}
+                  onChange={(e) => onSelectAcademicYear(Number(e.target.value))}
+                  className="rounded-xl border border-slate-300 bg-slate-50 px-3 py-1.5 text-xs font-bold text-[#0B1F3A]"
+                >
+                  {availableYears.map((y) => (
+                    <option key={y} value={y}>
+                      {y}年度
+                    </option>
+                  ))}
+                </select>
 
-              <div className="flex items-center gap-1.5 border-l border-slate-200 pl-2">
-                <input
-                  type="number"
-                  min={2020}
-                  max={2100}
-                  value={newYearInput}
-                  onChange={(e) => setNewYearInput(Number(e.target.value))}
-                  className="w-24 rounded-xl border border-slate-300 px-2.5 py-1.5 text-xs"
-                />
+                <div className="flex items-center gap-1.5 border-l border-slate-200 pl-2">
+                  <input
+                    type="number"
+                    min={2020}
+                    max={2100}
+                    value={newYearInput}
+                    onChange={(e) => setNewYearInput(Number(e.target.value))}
+                    className="w-20 rounded-xl border border-slate-300 px-2.5 py-1.5 text-xs"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onAddAcademicYear(newYearInput);
+                      setBannerMessage(
+                        `${newYearInput}年度のスケジュールを作成し、切り替えました。`
+                      );
+                      setNewYearInput(newYearInput + 1);
+                    }}
+                    className="inline-flex items-center gap-1 rounded-xl border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    年度追加
+                  </button>
+                </div>
+
                 <button
                   type="button"
-                  onClick={() => {
-                    onAddAcademicYear(newYearInput);
-                    setBannerMessage(
-                      `${newYearInput}年度の公式イベント設定を作成し、切り替えました。`
-                    );
-                    setNewYearInput(newYearInput + 1);
-                  }}
-                  className="inline-flex items-center gap-1 rounded-xl border border-blue-600 px-3 py-1.5 text-xs font-semibold text-blue-600 hover:bg-blue-50"
+                  onClick={() => setShowAddEventModal(true)}
+                  className="inline-flex items-center gap-1 rounded-xl bg-[#2563EB] px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700"
                 >
                   <Plus className="h-3.5 w-3.5" />
-                  年度を追加
+                  予定・授業・行事を追加
+                </button>
+
+                <button
+                  type="button"
+                  disabled={syncingCalendar}
+                  onClick={async () => {
+                    setSyncingCalendar(true);
+                    try {
+                      const msg = await onSyncGoogleCalendarBidirectional(
+                        selectedAcademicYear
+                      );
+                      setBannerMessage(msg);
+                    } finally {
+                      setSyncingCalendar(false);
+                    }
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-[#0B1F3A] px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50"
+                >
+                  <RefreshCw
+                    className={`h-3.5 w-3.5 ${
+                      syncingCalendar ? 'animate-spin' : ''
+                    }`}
+                  />
+                  Googleカレンダー双方向同期
                 </button>
               </div>
             </div>
-          </div>
 
-          <div className="mt-4 divide-y divide-slate-200">
-            {academicEvents.map((ev) => (
-              <div
-                key={ev.eventKey}
-                className="grid grid-cols-1 items-center gap-3 py-4 sm:grid-cols-12"
-              >
-                <div className="sm:col-span-5">
-                  <div className="flex items-center gap-2">
-                    <span className="rounded bg-[#0B1F3A] px-2 py-0.5 text-xs font-bold text-white">
-                      {ev.target}
-                    </span>
-                    <span className="font-mono text-xs text-slate-400">
-                      {ev.eventKey}
-                    </span>
-                  </div>
-                  <p className="mt-1 text-sm font-bold text-slate-900">
-                    {ev.name}
-                  </p>
-                  <p className="text-xs text-slate-500">{ev.notes}</p>
-                </div>
+            <div className="mt-4 divide-y divide-slate-200">
+              {academicEvents.map((ev) => {
+                const cat = ev.eventCategory ?? 'OFFICIAL';
+                const isOfficial = cat === 'OFFICIAL';
+                return (
+                  <div
+                    key={ev.eventKey}
+                    className="grid grid-cols-1 items-center gap-3 py-4 sm:grid-cols-12"
+                  >
+                    <div className="sm:col-span-5">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span
+                          className={`rounded px-2 py-0.5 text-xs font-bold ${
+                            cat === 'OFFICIAL'
+                              ? 'bg-[#0B1F3A] text-white'
+                              : cat === 'CLASS'
+                              ? 'bg-emerald-100 text-emerald-800'
+                              : 'bg-blue-100 text-blue-800'
+                          }`}
+                        >
+                          {SCHEDULE_EVENT_CATEGORY_LABELS[cat]}
+                        </span>
+                        <span className="rounded bg-slate-100 px-2 py-0.5 text-xs font-bold text-slate-700">
+                          対象: {ev.target}
+                        </span>
+                        {ev.syncOrigin === 'GOOGLE_CALENDAR' && (
+                          <span className="rounded bg-purple-100 px-2 py-0.5 text-[11px] font-bold text-purple-800">
+                            Googleカレンダーから取込
+                          </span>
+                        )}
+                      </div>
+                      <p className="mt-1 text-sm font-bold text-slate-900">
+                        {ev.name}
+                      </p>
+                      <p className="text-xs text-slate-500">{ev.notes}</p>
+                    </div>
 
-                <div className="sm:col-span-3">
-                  <label className="block text-[11px] font-semibold text-slate-500">
-                    {selectedAcademicYear}年度 公式日付
-                  </label>
-                  <input
-                    type="date"
-                    value={ev.date ?? ''}
-                    onChange={(e) =>
-                      onUpdateAcademicEvent(selectedAcademicYear, ev.eventKey, {
-                        date: e.target.value || null,
-                      })
-                    }
-                    className="mt-1 rounded-xl border border-slate-300 px-3 py-1.5 text-xs"
-                  />
-                </div>
+                    <div className="sm:col-span-3">
+                      <label className="block text-[11px] font-semibold text-slate-500">
+                        日付
+                      </label>
+                      <input
+                        type="date"
+                        value={ev.date ?? ''}
+                        onChange={(e) =>
+                          onUpdateAcademicEvent(
+                            selectedAcademicYear,
+                            ev.eventKey,
+                            {
+                              date: e.target.value || null,
+                            }
+                          )
+                        }
+                        className="mt-1 rounded-xl border border-slate-300 px-3 py-1.5 text-xs"
+                      />
+                    </div>
 
-                <div className="sm:col-span-2">
-                  <label className="block text-[11px] font-semibold text-slate-500">
-                    時刻
-                  </label>
-                  <input
-                    type="time"
-                    value={ev.time ?? ''}
-                    onChange={(e) =>
-                      onUpdateAcademicEvent(selectedAcademicYear, ev.eventKey, {
-                        time: e.target.value || null,
-                      })
-                    }
-                    className="mt-1 rounded-xl border border-slate-300 px-3 py-1.5 text-xs"
-                  />
-                </div>
+                    <div className="sm:col-span-2">
+                      <label className="block text-[11px] font-semibold text-slate-500">
+                        時刻
+                      </label>
+                      <input
+                        type="time"
+                        value={ev.time ?? ''}
+                        onChange={(e) =>
+                          onUpdateAcademicEvent(
+                            selectedAcademicYear,
+                            ev.eventKey,
+                            {
+                              time: e.target.value || null,
+                            }
+                          )
+                        }
+                        className="mt-1 rounded-xl border border-slate-300 px-3 py-1.5 text-xs"
+                      />
+                    </div>
 
-                <div className="sm:col-span-2">
-                  <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700">
-                    <input
-                      type="checkbox"
-                      checked={ev.calendarDisplay}
-                      onChange={(e) =>
-                        onUpdateAcademicEvent(
-                          selectedAcademicYear,
-                          ev.eventKey,
-                          {
-                            calendarDisplay: e.target.checked,
+                    <div className="flex items-center justify-end gap-2 sm:col-span-2">
+                      <label className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-700">
+                        <input
+                          type="checkbox"
+                          checked={ev.calendarDisplay}
+                          onChange={(e) =>
+                            onUpdateAcademicEvent(
+                              selectedAcademicYear,
+                              ev.eventKey,
+                              {
+                                calendarDisplay: e.target.checked,
+                              }
+                            )
                           }
-                        )
-                      }
-                      className="rounded border-slate-300 text-blue-600"
-                    />
-                    Calendar同期
-                  </label>
-                </div>
-              </div>
-            ))}
+                          className="rounded border-slate-300 text-blue-600"
+                        />
+                        GCal同期
+                      </label>
+                      {!isOfficial && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onDeleteAcademicEvent(
+                              selectedAcademicYear,
+                              ev.eventKey
+                            )
+                          }
+                          className="rounded border border-red-200 p-1.5 text-red-600 hover:bg-red-50"
+                          title="予定を削除"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         </div>
       )}
@@ -1551,56 +1777,68 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       )}
 
       {/* =====================================================================
-          TAB 6: 通知・リマインド設定確認 (#57〜#62)
+          TAB 6: ⑤ メール送信・リマインド管理 & GAS連携ブリッジ設定 (#57〜#62)
          ===================================================================== */}
       {subTab === 'NOTIFICATIONS' && (
         <div className="space-y-5">
           <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs">
-            <div className="flex items-start gap-3">
-              <Bell className="mt-0.5 h-5 w-5 text-[#2563EB]" />
-              <div>
-                <h2 className="text-base font-bold text-[#0B1F3A]">
-                  学生別リマインドメール送信仕様・設定確認
-                </h2>
-                <p className="mt-1 text-xs leading-relaxed text-slate-600">
-                  各学生が設定した「個人目標日」（または「共通公式期限」）に対して、
-                  <strong>14日前・7日前・3日前・当日（朝8:00 Asia/Tokyo）</strong>
-                  に、その学生固有の未完了タスクのみを個別に通知します。
-                </p>
+            <div className="flex flex-wrap items-start justify-between gap-4">
+              <div className="flex items-start gap-3">
+                <Bell className="mt-0.5 h-5 w-5 text-[#2563EB]" />
+                <div>
+                  <h2 className="text-base font-bold text-[#0B1F3A]">
+                    学生別リマインドメール送信 & 自動配信ブリッジ設定
+                  </h2>
+                  <p className="mt-1 text-xs leading-relaxed text-slate-600">
+                    送信元 <strong>{SYSTEM_REMINDER_SENDER_EMAIL}</strong> から各学生の個別メールアドレス宛てにリマインドメールを送信します。
+                    <br />
+                    下の「個別メール送信」ボタンで即座に送信できるほか、無料のGoogle Apps Script (GAS) ブリッジURLを設定するとバックグラウンド自動送信＆Googleカレンダー双方向同期が完全自動で動作します。
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setShowGasScriptModal(true)}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-[#0B1F3A] px-3.5 py-2 text-xs font-semibold text-white hover:bg-slate-800"
+              >
+                <Copy className="h-3.5 w-3.5" />
+                無料メール送信・GCal連携用GASコードを取得
+              </button>
+            </div>
+
+            {/* GAS Webhook URL 設定欄 */}
+            <div className="mt-4 rounded-xl border border-blue-200 bg-blue-50/40 p-4 text-xs">
+              <label className="block font-bold text-[#0B1F3A]">
+                メール自動送信 & Googleカレンダー双方向同期ブリッジ URL（任意・設定するとワンクリック自動送信になります）
+              </label>
+              <div className="mt-2 flex flex-col gap-2 sm:flex-row">
+                <input
+                  type="url"
+                  value={operationConfig.gasBridgeWebhookUrl}
+                  onChange={(e) =>
+                    onUpdateOperationConfig({
+                      gasBridgeWebhookUrl: e.target.value.trim(),
+                    })
+                  }
+                  placeholder="https://script.google.com/macros/s/xxxxxx/exec"
+                  className="flex-1 rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs"
+                />
+                <span className="inline-flex items-center rounded-xl bg-white px-3 py-2 font-semibold text-slate-700">
+                  状態:{' '}
+                  {operationConfig.gasBridgeWebhookUrl
+                    ? '✅ GAS自動送信ブリッジ接続済'
+                    : 'メーラー起動 / ローカル記録モード'}
+                </span>
               </div>
             </div>
 
-            <div className="mt-4 grid grid-cols-1 gap-4 rounded-xl border border-blue-100 bg-blue-50/50 p-4 text-xs sm:grid-cols-3">
-              <div>
-                <span className="font-semibold text-slate-500">
-                  リマインド送信元（From / 管理者連絡先）
-                </span>
-                <p className="mt-1 flex items-center gap-1.5 font-mono font-bold text-[#0B1F3A]">
-                  <Mail className="h-3.5 w-3.5 text-blue-600" />
-                  {SYSTEM_REMINDER_SENDER_EMAIL}
-                </p>
-              </div>
-              <div>
-                <span className="font-semibold text-slate-500">
-                  送信先（To）の決定ルール
-                </span>
-                <p className="mt-1 font-bold text-slate-800">
-                  学生ごとに登録された個別メールアドレス (`student.email`)
-                </p>
-              </div>
-              <div>
-                <span className="font-semibold text-slate-500">
-                  重複送信防止キー (`notificationId`)
-                </span>
-                <p className="mt-1 font-mono text-slate-700">
-                  studentId_taskId_dueDate_remindDays
-                </p>
-              </div>
+            <div className="mt-6 flex items-center justify-between">
+              <h3 className="text-sm font-bold text-[#0B1F3A]">
+                現在の学生別 通知対象タスク（14日以内期限・期限超過）
+              </h3>
             </div>
 
-            <h3 className="mt-6 text-sm font-bold text-[#0B1F3A]">
-              現在の学生別 通知対象タスク（14日以内期限・期限超過）
-            </h3>
             {studentNotificationQueue.length === 0 ? (
               <p className="mt-3 py-6 text-center text-xs text-slate-500">
                 現在、14日以内に期限が到来する未完了タスクはありません。
@@ -1610,36 +1848,83 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 {studentNotificationQueue.map((item) => (
                   <div
                     key={item.notificationId}
-                    className="flex flex-col justify-between gap-2 py-3 sm:flex-row sm:items-center"
+                    className="flex flex-col justify-between gap-3 py-3.5 sm:flex-row sm:items-center"
                   >
                     <div>
-                      <span className="font-bold text-slate-900">
-                        宛先: {item.student.name} ({item.student.email})
-                      </span>
-                      <span className="ml-2 text-slate-500">
-                        送信元: {SYSTEM_REMINDER_SENDER_EMAIL}
-                      </span>
-                      <p className="mt-0.5 font-medium text-slate-700">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-bold text-slate-900">
+                          宛先: {item.student.name} ({item.student.email})
+                        </span>
+                        <span className="text-slate-400">
+                          ← 送信元: {SYSTEM_REMINDER_SENDER_EMAIL}
+                        </span>
+                        {item.alreadySent && (
+                          <span className="rounded-full bg-green-100 px-2 py-0.5 text-[11px] font-bold text-green-800">
+                            送信済 ({item.notificationId})
+                          </span>
+                        )}
+                      </div>
+                      <p className="mt-1 font-medium text-slate-700">
                         対象タスク: [{item.record.taskId}] {item.record.title}
-                        （期限: {item.record.appliedDueDate}）
+                        （適用期限: {item.record.appliedDueDate} /{' '}
+                        {item.remainingDays < 0
+                          ? `${Math.abs(item.remainingDays)}日超過`
+                          : `残り${item.remainingDays}日`}
+                        ）
                       </p>
                     </div>
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono text-[11px] text-slate-400">
-                        {item.notificationId}
-                      </span>
-                      {item.isTriggerDay ? (
-                        <span className="rounded-full bg-blue-100 px-2.5 py-0.5 font-bold text-blue-800">
-                          本日通知対象（残り{item.remainingDays}日）
-                        </span>
-                      ) : (
-                        <span className="rounded-full bg-slate-100 px-2.5 py-0.5 text-slate-600">
-                          残り{item.remainingDays}日
-                        </span>
-                      )}
+                    <div className="flex shrink-0 items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          const res = await onSendReminderEmail({
+                            notificationId: item.notificationId,
+                            progressId: item.record.progressId,
+                            studentId: item.student.studentId,
+                            studentName: item.student.name,
+                            recipientEmail: item.student.email,
+                            taskId: item.record.taskId,
+                            taskTitle: item.record.title,
+                            dueDate: item.record.appliedDueDate!,
+                            remindDays: item.remainingDays,
+                          });
+                          setBannerMessage(res.message);
+                        }}
+                        className="inline-flex items-center gap-1.5 rounded-xl bg-[#2563EB] px-3.5 py-2 text-xs font-semibold text-white hover:bg-blue-700"
+                      >
+                        <Send className="h-3.5 w-3.5" />
+                        {item.alreadySent
+                          ? '再送信する'
+                          : 'リマインドメールを送信'}
+                      </button>
                     </div>
                   </div>
                 ))}
+              </div>
+            )}
+
+            {/* 送信履歴ログ (#61) */}
+            {notificationLogs.length > 0 && (
+              <div className="mt-6 border-t border-slate-200 pt-5">
+                <h4 className="text-xs font-bold text-slate-700">
+                  メール送信履歴 (`notificationLogs`)
+                </h4>
+                <div className="mt-2 divide-y divide-slate-100 text-xs">
+                  {notificationLogs.slice(0, 10).map((log) => (
+                    <div
+                      key={log.notificationId + log.sentAt}
+                      className="flex items-center justify-between py-2"
+                    >
+                      <span>
+                        <strong>{log.recipientEmail}</strong> — タスク{' '}
+                        {log.taskId} (期限: {log.dueDate})
+                      </span>
+                      <span className="text-slate-500">
+                        {log.result} ({log.sentAt.slice(0, 16).replace('T', ' ')})
+                      </span>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
           </div>
@@ -1647,7 +1932,194 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       )}
 
       {/* =====================================================================
-          TAB 7: 監査ログ (#70, #71)
+          TAB 7: ④ 研究プロセス履歴（全学生の研究経過記録・振り返り）
+         ===================================================================== */}
+      {subTab === 'PROCESS_LOGS' && (
+        <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs">
+          <div className="flex items-center gap-2 border-b border-slate-200 pb-4">
+            <BookOpen className="h-5 w-5 text-[#0B1F3A]" />
+            <div>
+              <h2 className="text-base font-bold text-[#0B1F3A]">
+                研究プロセスの蓄積・振り返り記録（全学生タイムライン）
+              </h2>
+              <p className="text-xs text-slate-500">
+                単に現在のステータスを表示するだけでなく、各学生の研究がどのような過程・コメントで進んできたかを時系列で記録しています。
+              </p>
+            </div>
+          </div>
+
+          {processLogs.length === 0 ? (
+            <p className="mt-6 py-8 text-center text-xs text-slate-500">
+              まだ研究プロセス履歴はありません。学生または管理者が進捗を更新すると自動的に蓄積されます。
+            </p>
+          ) : (
+            <div className="mt-4 space-y-3 text-xs">
+              {processLogs.map((log) => (
+                <div
+                  key={log.logId}
+                  className="rounded-xl border border-slate-200 bg-slate-50 p-4"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <span className="rounded bg-[#0B1F3A] px-2 py-0.5 font-bold text-white">
+                        {log.grade}
+                      </span>
+                      <span className="font-bold text-slate-900">
+                        {log.recordedByName} ({log.studentId})
+                      </span>
+                      <span className="font-mono text-slate-500">
+                        [{log.taskId}] {log.taskTitle}
+                      </span>
+                    </div>
+                    <span className="text-slate-500">
+                      {log.recordedAt.slice(0, 16).replace('T', ' ')}
+                    </span>
+                  </div>
+                  <div className="mt-2 flex items-center gap-2">
+                    <StatusBadge status={log.previousStatus} />
+                    <span>→</span>
+                    <StatusBadge status={log.newStatus} />
+                    {log.personalTargetDate && (
+                      <span className="ml-2 text-slate-600">
+                        目標日: {log.personalTargetDate}
+                      </span>
+                    )}
+                  </div>
+                  {log.comment && (
+                    <p className="mt-2 rounded bg-white p-2 text-slate-800">
+                      研究メモ: {log.comment}
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* =====================================================================
+          TAB 8: ②・④ 来年度の管理体制・役割分担・運用ルール設定
+         ===================================================================== */}
+      {subTab === 'OPERATION_POLICY' && (
+        <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs">
+          <div className="flex items-center gap-2 border-b border-slate-200 pb-4">
+            <ShieldCheck className="h-5 w-5 text-[#0B1F3A]" />
+            <div>
+              <h2 className="text-base font-bold text-[#0B1F3A]">
+                管理体制・役割分担および継続運用ルール設定
+              </h2>
+              <p className="text-xs text-slate-500">
+                来年度以降の継続運用に向けて、「誰がシステムを管理するか（年間スケジュール登録・タスク更新・進捗確認）」「学生がどのタイミングで更新するか」を明確化し、研究室全体で共有します。
+              </p>
+            </div>
+          </div>
+
+          <div className="mt-5 grid grid-cols-1 gap-4 text-xs sm:grid-cols-2">
+            <div>
+              <label className="font-bold text-slate-700">
+                全体主管理者（アカウント管理・最終承認）
+              </label>
+              <input
+                type="text"
+                value={operationConfig.primaryAdminName}
+                onChange={(e) =>
+                  onUpdateOperationConfig({ primaryAdminName: e.target.value })
+                }
+                className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+              />
+            </div>
+
+            <div>
+              <label className="font-bold text-slate-700">
+                学生管理・運用リーダー（兼務権限付与対象：菊水・立山 等）
+              </label>
+              <input
+                type="text"
+                value={operationConfig.studentAdminNames}
+                onChange={(e) =>
+                  onUpdateOperationConfig({ studentAdminNames: e.target.value })
+                }
+                className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+              />
+            </div>
+
+            <div>
+              <label className="font-bold text-slate-700">
+                年間スケジュール・Googleカレンダー管理担当
+              </label>
+              <input
+                type="text"
+                value={operationConfig.scheduleManagerName}
+                onChange={(e) =>
+                  onUpdateOperationConfig({
+                    scheduleManagerName: e.target.value,
+                  })
+                }
+                className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+              />
+            </div>
+
+            <div>
+              <label className="font-bold text-slate-700">
+                ロードマップタスク更新・情報修正担当
+              </label>
+              <input
+                type="text"
+                value={operationConfig.taskManagerName}
+                onChange={(e) =>
+                  onUpdateOperationConfig({ taskManagerName: e.target.value })
+                }
+                className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+              />
+            </div>
+
+            <div className="sm:col-span-2">
+              <label className="font-bold text-slate-700">
+                学生の進捗更新タイミング（学生画面上部に常時表示されます）
+              </label>
+              <input
+                type="text"
+                value={operationConfig.updateTimingRule}
+                onChange={(e) =>
+                  onUpdateOperationConfig({ updateTimingRule: e.target.value })
+                }
+                className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+              />
+            </div>
+
+            <div className="sm:col-span-2">
+              <label className="font-bold text-slate-700">
+                研究室全体での進捗確認方法（ゼミ運用ルール）
+              </label>
+              <input
+                type="text"
+                value={operationConfig.reviewMethodRule}
+                onChange={(e) =>
+                  onUpdateOperationConfig({ reviewMethodRule: e.target.value })
+                }
+                className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+              />
+            </div>
+
+            <div className="sm:col-span-2">
+              <label className="font-bold text-slate-700">
+                連携GoogleカレンダーID（研究・授業・研究室行事の一元管理先）
+              </label>
+              <input
+                type="text"
+                value={operationConfig.googleCalendarId}
+                onChange={(e) =>
+                  onUpdateOperationConfig({ googleCalendarId: e.target.value })
+                }
+                className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* =====================================================================
+          TAB 9: 監査ログ (#70, #71)
          ===================================================================== */}
       {subTab === 'AUDIT' && (
         <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs">
@@ -1655,7 +2127,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             監査ログ（重要管理操作履歴）
           </h2>
           <p className="mt-1 text-xs text-slate-500">
-            学生作成・在籍変更・進級・パスワードリセット・年度設定変更・タスク増減等の操作を自動記録します。
+            学生作成・在籍変更・進級・パスワードリセット・年度設定変更・タスク増減・メール送信等の操作を自動記録します。
           </p>
           {auditLogs.length === 0 ? (
             <p className="mt-4 py-6 text-center text-xs text-slate-500">
@@ -1686,6 +2158,167 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               ))}
             </div>
           )}
+        </div>
+      )}
+
+      {/* 予定・授業・研究室行事の追加モーダル (③対応) */}
+      {showAddEventModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
+          <div className="w-full max-w-lg rounded-2xl bg-white p-6 shadow-xl">
+            <h3 className="text-base font-bold text-[#0B1F3A]">
+              {selectedAcademicYear}年度 スケジュール・授業・研究室行事の追加
+            </h3>
+            <form
+              className="mt-4 space-y-3 text-xs"
+              onSubmit={handleAddEventSubmit}
+            >
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="font-bold text-slate-700">予定種別</label>
+                  <select
+                    value={newEvCategory}
+                    onChange={(e) =>
+                      setNewEvCategory(
+                        e.target.value as ScheduleEventCategory
+                      )
+                    }
+                    className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+                  >
+                    <option value="LAB_EVENT">研究室行事・ゼミイベント</option>
+                    <option value="CLASS">授業・講義日程</option>
+                    <option value="OFFICIAL">公式研究日程</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="font-bold text-slate-700">対象学年</label>
+                  <select
+                    value={newEvTarget}
+                    onChange={(e) =>
+                      setNewEvTarget(e.target.value as MasterGrade | 'ALL')
+                    }
+                    className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+                  >
+                    <option value="ALL">全員 (ALL)</option>
+                    <option value="M1">M1</option>
+                    <option value="M2">M2</option>
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className="font-bold text-slate-700">
+                  予定・行事タイトル
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={newEvName}
+                  onChange={(e) => setNewEvName(e.target.value)}
+                  placeholder="例: 春学期合同ゼミ / 統計学特別講義 / 研究室抄読会"
+                  className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="font-bold text-slate-700">日付</label>
+                  <input
+                    type="date"
+                    required
+                    value={newEvDate}
+                    onChange={(e) => setNewEvDate(e.target.value)}
+                    className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+                  />
+                </div>
+                <div>
+                  <label className="font-bold text-slate-700">時刻</label>
+                  <input
+                    type="time"
+                    value={newEvTime}
+                    onChange={(e) => setNewEvTime(e.target.value)}
+                    className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="font-bold text-slate-700">備考・場所等</label>
+                <input
+                  type="text"
+                  value={newEvNotes}
+                  onChange={(e) => setNewEvNotes(e.target.value)}
+                  placeholder="場所や持ち物など"
+                  className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
+                />
+              </div>
+
+              <div className="mt-5 flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowAddEventModal(false)}
+                  className="rounded-xl border border-slate-300 px-4 py-2 font-semibold text-slate-700"
+                >
+                  キャンセル
+                </button>
+                <button
+                  type="submit"
+                  className="rounded-xl bg-[#2563EB] px-4 py-2 font-semibold text-white hover:bg-blue-700"
+                >
+                  スケジュールに追加
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* GAS メール送信 & Googleカレンダー双方向連携コード取得モーダル */}
+      {showGasScriptModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
+          <div className="w-full max-w-2xl rounded-2xl bg-white p-6 shadow-xl">
+            <h3 className="text-base font-bold text-[#0B1F3A]">
+              無料メール自動送信 & Googleカレンダー双方向連携スクリプト (GAS)
+            </h3>
+            <p className="mt-1 text-xs leading-relaxed text-slate-600">
+              `nittai.daigakuin@gmail.com` で{' '}
+              <a
+                href="https://script.google.com/"
+                target="_blank"
+                rel="noreferrer"
+                className="font-bold text-blue-600 underline"
+              >
+                Google Apps Script
+              </a>{' '}
+              を開き、以下のコードを貼り付けて「デプロイ ＞ 新しいデプロイ ＞ ウェブアプリ（アクセスできるユーザー：全員）」として公開すると、完全無料で実メール送信とGoogleカレンダー双方向同期が動作します。
+            </p>
+            <pre className="mt-3 max-h-80 overflow-y-auto rounded-xl bg-slate-900 p-4 font-mono text-[11px] text-slate-100">
+              {GAS_EMAIL_AND_CALENDAR_BRIDGE_CODE}
+            </pre>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  void navigator.clipboard.writeText(
+                    GAS_EMAIL_AND_CALENDAR_BRIDGE_CODE
+                  );
+                  setBannerMessage(
+                    '連携用GASスクリプトをクリップボードにコピーしました。'
+                  );
+                }}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-[#2563EB] px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700"
+              >
+                <Copy className="h-3.5 w-3.5" />
+                コードをコピー
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowGasScriptModal(false)}
+                className="rounded-xl border border-slate-300 px-4 py-2 text-xs font-semibold text-slate-700"
+              >
+                閉じる
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -1861,12 +2494,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               別PC・スマホ間のリアルタイム共有（Firebase Cloud Firestore 接続）
             </h3>
             <p className="mt-1 text-xs leading-relaxed text-slate-600">
-              同一PC・同一ブラウザ内の別タブ間では現在もリアルタイムに連動しますが、
-              <strong>
-                学生のスマートフォンや別PCからの更新を先生のPCへインターネット越しにリアルタイム反映
-              </strong>
-              するには、Firebase Consoleのウェブアプリ設定値（またはCloudflare
-              Pagesの環境変数 `VITE_FIREBASE_API_KEY` / `VITE_FIREBASE_PROJECT_ID`）を入力してください。
+              学生のスマートフォンや別PCからの更新をインターネット越しにリアルタイム反映するには、Firebase Consoleのウェブアプリ設定値を入力してください。
             </p>
 
             <div className="mt-4 space-y-3 text-xs">
@@ -1977,6 +2605,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     required
                     value={newName}
                     onChange={(e) => setNewName(e.target.value)}
+                    placeholder="例: 菊水 / 立山"
                     className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2"
                   />
                 </div>
@@ -2080,7 +2709,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     checked={newIsAdminAlso}
                     onChange={(e) => setNewIsAdminAlso(e.target.checked)}
                   />
-                  管理者権限も付与（兼務）
+                  管理者権限も付与（学生管理担当・兼務）
                 </label>
               </div>
 
@@ -2238,7 +2867,6 @@ const StudentDetailPanel: React.FC<StudentDetailPanelProps> = ({
                 {student.name}（{student.studentId}）
               </h2>
 
-              {/* 在籍状態の即時変更セレクター (#23) */}
               <div className="inline-flex items-center gap-1.5 text-xs">
                 <span className="font-semibold text-slate-500">在籍状態:</span>
                 <select

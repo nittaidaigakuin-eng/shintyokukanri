@@ -17,7 +17,10 @@ import {
 import type {
   AcademicYear,
   AuditLog,
+  LabOperationConfig,
+  NotificationLog,
   ProgressRecord,
+  ResearchProcessLogEntry,
   RoadmapTask,
   Student,
 } from '../../types/domain';
@@ -39,6 +42,9 @@ export interface SharedAppState {
   academicYearsMap: Record<number, AcademicYear>;
   selectedAcademicYear: number;
   progressRecords: ProgressRecord[];
+  processLogs?: ResearchProcessLogEntry[];
+  notificationLogs?: NotificationLog[];
+  operationConfig?: LabOperationConfig;
   auditLogs: AuditLog[];
   updatedAt: string;
 }

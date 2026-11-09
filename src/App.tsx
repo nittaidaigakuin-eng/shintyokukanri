@@ -18,10 +18,14 @@ import type {
   DeadlineRule,
   DeadlineType,
   EnrollmentStatus,
+  LabOperationConfig,
   MasterGrade,
+  NotificationLog,
   ProgressRecord,
   ProgressStatus,
+  ResearchProcessLogEntry,
   RoadmapTask,
+  ScheduleEventCategory,
   Student,
   UserProfile,
 } from './types/domain';
@@ -33,16 +37,22 @@ import {
   buildInitialDemoProgress,
   INITIAL_ACADEMIC_YEARS,
   INITIAL_AUDIT_LOGS,
+  INITIAL_LAB_OPERATION_CONFIG,
+  INITIAL_NOTIFICATION_LOGS,
+  INITIAL_PROCESS_LOGS,
   INITIAL_STUDENTS,
   INITIAL_USERS,
   sha256Hex,
+  SYSTEM_REMINDER_SENDER_EMAIL,
   type StoredAccount,
 } from './data/demoSeed';
 import {
   calculateCommonDueDate,
   getTokyoDateString,
+  mergeBidirectionalCalendarEvents,
   promoteStudentToM2,
   resolveAppliedDueDate,
+  type ExternalGoogleCalendarEvent,
 } from './lib/progressUtils';
 import {
   getActiveFirebaseConfig,
@@ -65,6 +75,9 @@ const STORAGE_KEYS = {
   selectedYear: 'shintyokukanri_v2_selected_year',
   progress: 'shintyokukanri_v2_progress',
   audit: 'shintyokukanri_v2_audit',
+  processLogs: 'shintyokukanri_v2_process_logs',
+  notificationLogs: 'shintyokukanri_v2_notification_logs',
+  operationConfig: 'shintyokukanri_v2_operation_config',
 };
 
 function loadPersisted<T>(key: string, fallback: T): T {
@@ -110,6 +123,21 @@ export const App: React.FC = () => {
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>(() =>
     loadPersisted(STORAGE_KEYS.audit, [...INITIAL_AUDIT_LOGS])
   );
+  const [processLogs, setProcessLogs] = useState<ResearchProcessLogEntry[]>(
+    () => loadPersisted(STORAGE_KEYS.processLogs, [...INITIAL_PROCESS_LOGS])
+  );
+  const [notificationLogs, setNotificationLogs] = useState<NotificationLog[]>(
+    () =>
+      loadPersisted(STORAGE_KEYS.notificationLogs, [
+        ...INITIAL_NOTIFICATION_LOGS,
+      ])
+  );
+  const [operationConfig, setOperationConfig] = useState<LabOperationConfig>(
+    () =>
+      loadPersisted(STORAGE_KEYS.operationConfig, {
+        ...INITIAL_LAB_OPERATION_CONFIG,
+      })
+  );
 
   const isCloudConnected = useMemo(
     () => Boolean(getActiveFirebaseConfig()),
@@ -135,6 +163,12 @@ export const App: React.FC = () => {
           setProgressRecords(JSON.parse(e.newValue));
         } else if (e.key === STORAGE_KEYS.audit) {
           setAuditLogs(JSON.parse(e.newValue));
+        } else if (e.key === STORAGE_KEYS.processLogs) {
+          setProcessLogs(JSON.parse(e.newValue));
+        } else if (e.key === STORAGE_KEYS.notificationLogs) {
+          setNotificationLogs(JSON.parse(e.newValue));
+        } else if (e.key === STORAGE_KEYS.operationConfig) {
+          setOperationConfig(JSON.parse(e.newValue));
         }
       } catch {
         // ignore parse errors
@@ -156,6 +190,9 @@ export const App: React.FC = () => {
         setSelectedAcademicYear(remote.selectedAcademicYear);
       if (remote.progressRecords) setProgressRecords(remote.progressRecords);
       if (remote.auditLogs) setAuditLogs(remote.auditLogs);
+      if (remote.processLogs) setProcessLogs(remote.processLogs);
+      if (remote.notificationLogs) setNotificationLogs(remote.notificationLogs);
+      if (remote.operationConfig) setOperationConfig(remote.operationConfig);
       setTimeout(() => {
         isApplyingRemoteRef.current = false;
       }, 50);
@@ -177,6 +214,9 @@ export const App: React.FC = () => {
         selectedAcademicYear: next.selectedAcademicYear ?? selectedAcademicYear,
         progressRecords: next.progressRecords ?? progressRecords,
         auditLogs: next.auditLogs ?? auditLogs,
+        processLogs: next.processLogs ?? processLogs,
+        notificationLogs: next.notificationLogs ?? notificationLogs,
+        operationConfig: next.operationConfig ?? operationConfig,
         updatedAt: new Date().toISOString(),
       });
     },
@@ -188,6 +228,9 @@ export const App: React.FC = () => {
       selectedAcademicYear,
       progressRecords,
       auditLogs,
+      processLogs,
+      notificationLogs,
+      operationConfig,
     ]
   );
 
@@ -258,6 +301,39 @@ export const App: React.FC = () => {
       // ignore
     }
   }, [auditLogs]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        STORAGE_KEYS.processLogs,
+        JSON.stringify(processLogs)
+      );
+    } catch {
+      // ignore
+    }
+  }, [processLogs]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        STORAGE_KEYS.notificationLogs,
+        JSON.stringify(notificationLogs)
+      );
+    } catch {
+      // ignore
+    }
+  }, [notificationLogs]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        STORAGE_KEYS.operationConfig,
+        JSON.stringify(operationConfig)
+      );
+    } catch {
+      // ignore
+    }
+  }, [operationConfig]);
 
   const userProfilesList = useMemo(
     () => Object.values(usersMap).map((u) => u.profile),
@@ -337,7 +413,7 @@ export const App: React.FC = () => {
     setCurrentUser(null);
   };
 
-  // 進捗レコード更新 (#35, #36, #43) — 学生が更新した際に students.updatedAt も自動更新して管理画面へ即反映！
+  // 進捗レコード更新 (#35, #36, #43) — 学生が更新した際に students.updatedAt も自動更新＆研究プロセス履歴へ自動蓄積！
   const handleUpdateProgress = (
     progressId: string,
     updates: {
@@ -349,6 +425,7 @@ export const App: React.FC = () => {
     if (!currentUser) return;
     const nowIso = new Date().toISOString();
     let targetStudentId: string | null = null;
+    let newProcessEntry: ResearchProcessLogEntry | null = null;
 
     const nextProgress = progressRecords.map((rec) => {
       if (rec.progressId !== progressId) return rec;
@@ -362,6 +439,28 @@ export const App: React.FC = () => {
       }
 
       targetStudentId = rec.studentId;
+
+      // 変更があった場合は研究プロセスの記録として履歴に蓄積
+      if (
+        rec.status !== updates.status ||
+        rec.personalTargetDate !== updates.personalTargetDate ||
+        rec.comment !== updates.comment
+      ) {
+        newProcessEntry = {
+          logId: `plog-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          studentId: rec.studentId,
+          taskId: rec.taskId,
+          taskTitle: rec.title,
+          category: rec.category,
+          grade: rec.historicalGrade,
+          previousStatus: rec.status,
+          newStatus: updates.status,
+          personalTargetDate: updates.personalTargetDate,
+          comment: updates.comment,
+          recordedAt: nowIso,
+          recordedByName: currentUser.displayName,
+        };
+      }
 
       const { appliedDueDate, dueSource } = resolveAppliedDueDate(
         updates.personalTargetDate,
@@ -395,9 +494,18 @@ export const App: React.FC = () => {
         )
       : students;
 
+    const nextProcessLogs = newProcessEntry
+      ? [newProcessEntry, ...processLogs]
+      : processLogs;
+
     setProgressRecords(nextProgress);
     setStudents(nextStudents);
-    syncToCloud({ progressRecords: nextProgress, students: nextStudents });
+    setProcessLogs(nextProcessLogs);
+    syncToCloud({
+      progressRecords: nextProgress,
+      students: nextStudents,
+      processLogs: nextProcessLogs,
+    });
   };
 
   // 管理者：学生の在籍状態（在籍・休学・修了・退学）や指導教員等の変更 (#23)
@@ -653,6 +761,50 @@ export const App: React.FC = () => {
     syncToCloud({ usersMap: nextUsers, auditLogs: nextAudit });
   };
 
+  // ② 来年度の管理体制：学生へ管理担当（兼務）権限をワンクリック付与・解除 (#11, #16)
+  const handleToggleStudentAdminRole = (
+    studentId: string,
+    isAdminAlso: boolean
+  ) => {
+    if (!currentUser?.roles.admin) return;
+    const nowIso = new Date().toISOString();
+
+    const nextUsers = { ...usersMap };
+    for (const [k, v] of Object.entries(nextUsers)) {
+      if (v.profile.studentId === studentId) {
+        nextUsers[k] = {
+          ...v,
+          profile: {
+            ...v.profile,
+            roles: {
+              ...v.profile.roles,
+              admin: isAdminAlso,
+            },
+            updatedAt: nowIso,
+          },
+        };
+      }
+    }
+
+    const nextAudit: AuditLog[] = [
+      {
+        auditId: `audit-${Date.now()}`,
+        action: 'CHANGE_ROLE',
+        actorUid: currentUser.uid,
+        actorEmail: currentUser.email,
+        targetType: 'student',
+        targetId: studentId,
+        details: { adminRole: isAdminAlso },
+        createdAt: nowIso,
+      },
+      ...auditLogs,
+    ];
+
+    setUsersMap(nextUsers);
+    setAuditLogs(nextAudit);
+    syncToCloud({ usersMap: nextUsers, auditLogs: nextAudit });
+  };
+
   // 管理者：パスワードリセット (#53: mustChangePassword = TRUE)
   const handleResetPassword = async (
     studentId: string,
@@ -743,7 +895,9 @@ export const App: React.FC = () => {
     if (!targetYearObj) return;
 
     const nextEvents = targetYearObj.events.map((ev) =>
-      ev.eventKey === eventKey ? { ...ev, ...updates } : ev
+      ev.eventKey === eventKey
+        ? { ...ev, ...updates, updatedAt: nowIso }
+        : ev
     );
 
     const nextYears = {
@@ -793,6 +947,460 @@ export const App: React.FC = () => {
     syncToCloud({
       academicYearsMap: nextYears,
       progressRecords: nextProgress,
+      auditLogs: nextAudit,
+    });
+  };
+
+  // ③ 授業・ゼミ・研究室全体行事・研究イベントの追加
+  const handleAddAcademicEvent = (
+    year: number,
+    input: {
+      name: string;
+      eventCategory: ScheduleEventCategory;
+      target: MasterGrade | 'ALL';
+      date: string;
+      time: string | null;
+      calendarDisplay: boolean;
+      notes: string;
+    }
+  ) => {
+    if (!currentUser?.roles.admin) return;
+    const nowIso = new Date().toISOString();
+    const targetYearObj = academicYearsMap[year];
+    if (!targetYearObj) return;
+
+    const eventKey = `${input.eventCategory}_${Date.now()}`;
+    const newEvent: AcademicEvent = {
+      eventKey,
+      name: input.name,
+      eventCategory: input.eventCategory,
+      target: input.target,
+      date: input.date,
+      time: input.time,
+      reminderDays: [7, 3, 0],
+      calendarDisplay: input.calendarDisplay,
+      notes: input.notes,
+      googleCalendarEventId: null,
+      syncOrigin: 'WEB_APP',
+      updatedAt: nowIso,
+    };
+
+    const nextEvents = [...targetYearObj.events, newEvent];
+    const nextYears = {
+      ...academicYearsMap,
+      [year]: {
+        ...targetYearObj,
+        updatedAt: nowIso,
+        events: nextEvents,
+      },
+    };
+    const nextAudit: AuditLog[] = [
+      {
+        auditId: `audit-${Date.now()}`,
+        action: 'UPDATE_ACADEMIC_YEAR',
+        actorUid: currentUser.uid,
+        actorEmail: currentUser.email,
+        targetType: 'academicEvent',
+        targetId: `${year}_${eventKey}`,
+        details: {
+          action: 'ADD_EVENT',
+          name: input.name,
+          category: input.eventCategory,
+        },
+        createdAt: nowIso,
+      },
+      ...auditLogs,
+    ];
+
+    setAcademicYearsMap(nextYears);
+    setAuditLogs(nextAudit);
+    syncToCloud({
+      academicYearsMap: nextYears,
+      auditLogs: nextAudit,
+    });
+  };
+
+  // 管理者：スケジュールイベントの削除
+  const handleDeleteAcademicEvent = (year: number, eventKey: string) => {
+    if (!currentUser?.roles.admin) return;
+    const nowIso = new Date().toISOString();
+    const targetYearObj = academicYearsMap[year];
+    if (!targetYearObj) return;
+
+    const nextEvents = targetYearObj.events.filter(
+      (ev) => ev.eventKey !== eventKey
+    );
+    const nextYears = {
+      ...academicYearsMap,
+      [year]: {
+        ...targetYearObj,
+        updatedAt: nowIso,
+        events: nextEvents,
+      },
+    };
+    setAcademicYearsMap(nextYears);
+    syncToCloud({ academicYearsMap: nextYears });
+  };
+
+  // ③ Googleカレンダー双方向同期 (Webアプリ ⇄ Googleカレンダー)
+  const handleSyncGoogleCalendarBidirectional = async (
+    year: number
+  ): Promise<string> => {
+    if (!currentUser?.roles.admin) return '管理者権限が必要です。';
+    const nowIso = new Date().toISOString();
+    const targetYearObj = academicYearsMap[year];
+    if (!targetYearObj) return '対象年度が見つかりません。';
+
+    const webhookUrl = operationConfig.gasBridgeWebhookUrl.trim();
+    if (webhookUrl) {
+      try {
+        const res = await fetch(webhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({
+            action: 'SYNC_CALENDAR_BIDIRECTIONAL',
+            calendarId: operationConfig.googleCalendarId || 'primary',
+            events: targetYearObj.events,
+          }),
+        });
+        const data = (await res.json()) as {
+          ok?: boolean;
+          pushedEvents?: Array<{
+            eventKey: string;
+            googleCalendarEventId: string | null;
+            updatedAt: string;
+          }>;
+          remoteCalendarEvents?: ExternalGoogleCalendarEvent[];
+          error?: string;
+        };
+
+        if (!data.ok) {
+          return `Googleカレンダー同期エラー: ${data.error ?? '不明なエラー'}`;
+        }
+
+        // 1. Web -> Google 側で発行された googleCalendarEventId を反映
+        const pushedMap = new Map(
+          (data.pushedEvents ?? []).map((p) => [p.eventKey, p])
+        );
+        const eventsWithIds = targetYearObj.events.map((ev) => {
+          const pushed = pushedMap.get(ev.eventKey);
+          if (!pushed) return ev;
+          return {
+            ...ev,
+            googleCalendarEventId: pushed.googleCalendarEventId,
+            updatedAt: pushed.updatedAt || nowIso,
+          };
+        });
+
+        // 2. Google -> Web 側の変更・新規予定（授業・行事含む）を双方向マージ
+        const {
+          mergedEvents,
+          importedCount,
+          updatedFromGoogleCount,
+        } = mergeBidirectionalCalendarEvents(
+          eventsWithIds,
+          data.remoteCalendarEvents ?? []
+        );
+
+        const nextYears = {
+          ...academicYearsMap,
+          [year]: {
+            ...targetYearObj,
+            updatedAt: nowIso,
+            events: mergedEvents,
+          },
+        };
+
+        // 共通期限の再計算
+        const taskMap = new Map(roadmapTasks.map((t) => [t.taskId, t]));
+        const nextProgress = progressRecords.map((rec) => {
+          const task = taskMap.get(rec.taskId);
+          if (!task || !task.baseEventKey) return rec;
+          const newCommonDue = calculateCommonDueDate(task, mergedEvents);
+          const { appliedDueDate, dueSource } = resolveAppliedDueDate(
+            rec.personalTargetDate,
+            newCommonDue
+          );
+          return {
+            ...rec,
+            commonDueDate: newCommonDue,
+            appliedDueDate,
+            dueSource,
+            updatedAt: nowIso,
+          };
+        });
+
+        const nextAudit: AuditLog[] = [
+          {
+            auditId: `audit-${Date.now()}`,
+            action: 'SYNC_GOOGLE_CALENDAR',
+            actorUid: currentUser.uid,
+            actorEmail: currentUser.email,
+            targetType: 'academicYear',
+            targetId: String(year),
+            details: {
+              importedCount,
+              updatedFromGoogleCount,
+              totalEvents: mergedEvents.length,
+            },
+            createdAt: nowIso,
+          },
+          ...auditLogs,
+        ];
+
+        setAcademicYearsMap(nextYears);
+        setProgressRecords(nextProgress);
+        setAuditLogs(nextAudit);
+        syncToCloud({
+          academicYearsMap: nextYears,
+          progressRecords: nextProgress,
+          auditLogs: nextAudit,
+        });
+
+        return `双方向同期が完了しました（Googleカレンダーから新規取込: ${importedCount}件 / 更新反映: ${updatedFromGoogleCount}件 / Web予定反映: ${mergedEvents.length}件）。`;
+      } catch (err) {
+        return `GASブリッジ通信に失敗しました: ${String(err)}`;
+      }
+    }
+
+    // GAS Webhook未設定時は iCalendar (.ics) ファイルを生成して即時ダウンロード提供
+    const validEvents = targetYearObj.events.filter(
+      (e) => e.calendarDisplay && e.date
+    );
+    const icsLines = [
+      'BEGIN:VCALENDAR',
+      'VERSION:2.0',
+      'PRODID:-//Nittai GradLab//ResearchProgress//JP',
+      'CALSCALE:GREGORIAN',
+      'METHOD:PUBLISH',
+    ];
+    for (const ev of validEvents) {
+      const ymd = (ev.date ?? '').replace(/-/g, '');
+      icsLines.push(
+        'BEGIN:VEVENT',
+        `UID:${ev.eventKey}-${year}@nittai.daigakuin`,
+        `DTSTAMP:${nowIso.replace(/[-:]/g, '').split('.')[0]}Z`,
+        `DTSTART;VALUE=DATE:${ymd}`,
+        `SUMMARY:${ev.name}`,
+        `DESCRIPTION:${(ev.notes || '').replace(/\n/g, '\\n')}`,
+        'END:VEVENT'
+      );
+    }
+    icsLines.push('END:VCALENDAR');
+
+    try {
+      const blob = new Blob([icsLines.join('\r\n')], {
+        type: 'text/calendar;charset=utf-8',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `lab_schedule_${year}.ics`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      // ignore in headless test environments
+    }
+
+    return `Googleカレンダー取込用ファイル (lab_schedule_${year}.ics: ${validEvents.length}件) を出力しました。「メール通知・送信」タブでGAS Webhook URLを設定すると、ボタン1つで自動双方向同期が動作します。`;
+  };
+
+  // ⑤ リマインドメール送信機能の確立（GAS Webhook 自動送信 ＋ メーラー即時送信フォールバック）
+  const handleSendReminderEmail = async (params: {
+    notificationId: string;
+    progressId: string;
+    studentId: string;
+    studentName: string;
+    recipientEmail: string;
+    taskId: string;
+    taskTitle: string;
+    dueDate: string;
+    remindDays: number;
+  }): Promise<{
+    ok: boolean;
+    mode: 'GAS_WEBHOOK' | 'MAILTO';
+    message: string;
+  }> => {
+    if (!currentUser?.roles.admin) {
+      return {
+        ok: false,
+        mode: 'MAILTO',
+        message: '管理者権限が必要です。',
+      };
+    }
+    const nowIso = new Date().toISOString();
+    const subject = `【研究進捗リマインド】${params.taskTitle}（期限: ${params.dueDate}）`;
+    const textBody = [
+      `${params.studentName} さん`,
+      '',
+      '大学院研究進捗管理システムからのリマインド連絡です。',
+      '以下の研究タスクの期限が近づいています（または到来しています）。',
+      '',
+      `■ 対象タスク: ${params.taskTitle} (${params.taskId})`,
+      `■ 適用期限日: ${params.dueDate}`,
+      '',
+      'Webアプリにログインし、現在の進捗状況（ステータス・個人目標日・メモ）を更新してください。',
+      '',
+      '--------------------------------------------------',
+      `送信元（管理者・リマインド共通）: ${SYSTEM_REMINDER_SENDER_EMAIL}`,
+      '--------------------------------------------------',
+    ].join('\n');
+
+    const webhookUrl = operationConfig.gasBridgeWebhookUrl.trim();
+    if (webhookUrl) {
+      try {
+        const res = await fetch(webhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({
+            action: 'SEND_EMAIL',
+            recipientEmail: params.recipientEmail,
+            subject,
+            textBody,
+          }),
+        });
+        const data = (await res.json()) as { ok?: boolean; error?: string };
+        const isSuccess = Boolean(data.ok);
+
+        const newLog: NotificationLog = {
+          notificationId: params.notificationId,
+          progressId: params.progressId,
+          studentId: params.studentId,
+          recipientEmail: params.recipientEmail,
+          taskId: params.taskId,
+          dueDate: params.dueDate,
+          remindDays: params.remindDays,
+          sentAt: nowIso,
+          result: isSuccess ? 'SUCCESS' : 'FAILED',
+          errorMessage: isSuccess ? null : (data.error ?? 'GAS送信エラー'),
+        };
+        const nextNotifLogs = [newLog, ...notificationLogs];
+        const nextAudit: AuditLog[] = [
+          {
+            auditId: `audit-${Date.now()}`,
+            action: 'SEND_REMINDER_EMAIL',
+            actorUid: currentUser.uid,
+            actorEmail: currentUser.email,
+            targetType: 'student',
+            targetId: params.studentId,
+            details: {
+              recipientEmail: params.recipientEmail,
+              taskId: params.taskId,
+              mode: 'GAS_WEBHOOK',
+              result: newLog.result,
+            },
+            createdAt: nowIso,
+          },
+          ...auditLogs,
+        ];
+
+        setNotificationLogs(nextNotifLogs);
+        setAuditLogs(nextAudit);
+        syncToCloud({
+          notificationLogs: nextNotifLogs,
+          auditLogs: nextAudit,
+        });
+
+        return {
+          ok: isSuccess,
+          mode: 'GAS_WEBHOOK',
+          message: isSuccess
+            ? `${params.studentName} (${params.recipientEmail}) へ ${SYSTEM_REMINDER_SENDER_EMAIL} からリマインドメールを自動送信しました。`
+            : `自動送信に失敗しました: ${data.error ?? '不明なエラー'}`,
+        };
+      } catch (err) {
+        return {
+          ok: false,
+          mode: 'GAS_WEBHOOK',
+          message: `GAS Webhook への通信に失敗しました: ${String(err)}`,
+        };
+      }
+    }
+
+    // GAS未設定時は mailto: で即座にメーラーを起動し、送信履歴にも記録
+    const mailtoUrl = `mailto:${encodeURIComponent(
+      params.recipientEmail
+    )}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(
+      textBody
+    )}`;
+    if (typeof window !== 'undefined') {
+      window.open(mailtoUrl, '_blank', 'noopener,noreferrer');
+    }
+
+    const newLog: NotificationLog = {
+      notificationId: params.notificationId,
+      progressId: params.progressId,
+      studentId: params.studentId,
+      recipientEmail: params.recipientEmail,
+      taskId: params.taskId,
+      dueDate: params.dueDate,
+      remindDays: params.remindDays,
+      sentAt: nowIso,
+      result: 'SUCCESS',
+      errorMessage: null,
+    };
+    const nextNotifLogs = [newLog, ...notificationLogs];
+    const nextAudit: AuditLog[] = [
+      {
+        auditId: `audit-${Date.now()}`,
+        action: 'SEND_REMINDER_EMAIL',
+        actorUid: currentUser.uid,
+        actorEmail: currentUser.email,
+        targetType: 'student',
+        targetId: params.studentId,
+        details: {
+          recipientEmail: params.recipientEmail,
+          taskId: params.taskId,
+          mode: 'MAILTO',
+        },
+        createdAt: nowIso,
+      },
+      ...auditLogs,
+    ];
+
+    setNotificationLogs(nextNotifLogs);
+    setAuditLogs(nextAudit);
+    syncToCloud({
+      notificationLogs: nextNotifLogs,
+      auditLogs: nextAudit,
+    });
+
+    return {
+      ok: true,
+      mode: 'MAILTO',
+      message: `${params.studentName} (${params.recipientEmail}) 宛のメール作成画面を起動し、送信ログを記録しました（GAS連携URLを設定するとバックグラウンド自動送信になります）。`,
+    };
+  };
+
+  // ② & ④ 研究室の管理体制・運用ルールの更新
+  const handleUpdateOperationConfig = (
+    updates: Partial<LabOperationConfig>
+  ) => {
+    if (!currentUser?.roles.admin) return;
+    const nowIso = new Date().toISOString();
+    const nextConfig: LabOperationConfig = {
+      ...operationConfig,
+      ...updates,
+      updatedAt: nowIso,
+    };
+    const nextAudit: AuditLog[] = [
+      {
+        auditId: `audit-${Date.now()}`,
+        action: 'UPDATE_OPERATION_CONFIG',
+        actorUid: currentUser.uid,
+        actorEmail: currentUser.email,
+        targetType: 'operationConfig',
+        targetId: 'lab_operation_config',
+        details: updates as Record<string, unknown>,
+        createdAt: nowIso,
+      },
+      ...auditLogs,
+    ];
+
+    setOperationConfig(nextConfig);
+    setAuditLogs(nextAudit);
+    syncToCloud({
+      operationConfig: nextConfig,
       auditLogs: nextAudit,
     });
   };
@@ -1001,6 +1609,9 @@ export const App: React.FC = () => {
     (s) => s.studentId === currentUser.studentId
   );
   const activeRoadmapTasks = roadmapTasks.filter((t) => t.active);
+  const currentAcademicEvents =
+    academicYearsMap[selectedAcademicYear]?.events ??
+    DEFAULT_ACADEMIC_EVENTS_2026;
 
   return (
     <div className="min-h-screen bg-slate-100 text-slate-900">
@@ -1090,17 +1701,28 @@ export const App: React.FC = () => {
             academicYearsMap={academicYearsMap}
             selectedAcademicYear={selectedAcademicYear}
             auditLogs={auditLogs}
+            processLogs={processLogs}
+            notificationLogs={notificationLogs}
+            operationConfig={operationConfig}
             todayTokyo={todayTokyo}
             isCloudConnected={isCloudConnected}
             onSelectAcademicYear={setSelectedAcademicYear}
             onAddAcademicYear={handleAddAcademicYear}
             onCreateStudent={handleCreateStudent}
             onUpdateStudentMeta={handleUpdateStudentMeta}
+            onToggleStudentAdminRole={handleToggleStudentAdminRole}
             onPromoteToM2={handlePromoteToM2}
             onToggleAccountActive={handleToggleAccountActive}
             onResetPassword={handleResetPassword}
             onAdminUpdateProgress={handleUpdateProgress}
             onUpdateAcademicEvent={handleUpdateAcademicEvent}
+            onAddAcademicEvent={handleAddAcademicEvent}
+            onDeleteAcademicEvent={handleDeleteAcademicEvent}
+            onSyncGoogleCalendarBidirectional={
+              handleSyncGoogleCalendarBidirectional
+            }
+            onSendReminderEmail={handleSendReminderEmail}
+            onUpdateOperationConfig={handleUpdateOperationConfig}
             onAddRoadmapTask={handleAddRoadmapTask}
             onUpdateRoadmapTask={handleUpdateRoadmapTask}
             onDeleteRoadmapTask={handleDeleteRoadmapTask}
@@ -1108,10 +1730,12 @@ export const App: React.FC = () => {
         ) : currentStudentRecord ? (
           <StudentDashboard
             student={currentStudentRecord}
-            progressRecords={progressRecords.filter(
-              // #73 学生は自分自身の studentId に紐づくデータのみ参照可能
-              (p) => p.studentId === currentStudentRecord.studentId
-            )}
+            allStudents={students}
+            allProgressRecords={progressRecords}
+            processLogs={processLogs}
+            academicYear={selectedAcademicYear}
+            academicEvents={currentAcademicEvents}
+            operationConfig={operationConfig}
             roadmapTasks={activeRoadmapTasks}
             todayTokyo={todayTokyo}
             onUpdateProgress={handleUpdateProgress}

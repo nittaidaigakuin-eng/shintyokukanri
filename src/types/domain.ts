@@ -1,6 +1,6 @@
 /**
  * 大学院研究進捗管理Webアプリ — ドメイン型定義
- * MASTER_SPEC.md および DATA_MODEL.md に完全準拠
+ * MASTER_SPEC.md および研究室からの追加意見（①学生間共有、②管理体制分担、③Googleカレンダー双方向連携・行事管理、④研究プロセス記録蓄積、⑤メール送信機能）に完全準拠
  */
 
 export type CourseType = 'MASTER' | 'DOCTOR';
@@ -78,7 +78,6 @@ export type DeadlineRule = 'EXACT' | 'PREVIOUS_MONDAY' | 'MANUAL' | 'NONE';
 
 /**
  * 24. roadmapTasks Collection (Document ID: taskId)
- * M1: 17件, M2: 44件, 合計: 61件
  */
 export interface RoadmapTask {
   taskId: string;
@@ -102,17 +101,39 @@ export interface RoadmapTask {
 }
 
 /**
+ * ③ Googleカレンダー双方向連携に対応する予定種別
+ * - OFFICIAL: 公式研究日程（中間発表・論文提出など共通期限の基準）
+ * - CLASS: 授業・ゼミ日程
+ * - LAB_EVENT: 研究室行事・ミーティング・学会等
+ */
+export type ScheduleEventCategory = 'OFFICIAL' | 'CLASS' | 'LAB_EVENT';
+
+export const SCHEDULE_EVENT_CATEGORY_LABELS: Record<
+  ScheduleEventCategory,
+  string
+> = {
+  OFFICIAL: '公式研究日程',
+  CLASS: '授業・ゼミ',
+  LAB_EVENT: '研究室行事',
+};
+
+/**
  * 29-30. academicYears/{year}/events/{eventKey}
+ * 双方向同期（Webアプリ ⇄ Google Calendar）に対応
  */
 export interface AcademicEvent {
   eventKey: string;
   name: string;
+  eventCategory?: ScheduleEventCategory;
   target: MasterGrade | 'ALL';
   date: string | null; // YYYY-MM-DD
   time: string | null; // HH:mm
   reminderDays: number[];
   calendarDisplay: boolean;
   notes: string;
+  googleCalendarEventId?: string | null;
+  syncOrigin?: 'WEB_APP' | 'GOOGLE_CALENDAR';
+  updatedAt?: string;
 }
 
 export interface AcademicYear {
@@ -123,8 +144,26 @@ export interface AcademicYear {
 }
 
 /**
+ * ④ 研究プロセスの記録・振り返り用ログエントリ
+ * 単なる現在の状態表示だけでなく、研究がどのような過程で進んできたかを時系列で蓄積する
+ */
+export interface ResearchProcessLogEntry {
+  logId: string;
+  studentId: string;
+  taskId: string;
+  taskTitle: string;
+  category: string;
+  grade: MasterGrade;
+  previousStatus: ProgressStatus;
+  newStatus: ProgressStatus;
+  personalTargetDate: string | null;
+  comment: string;
+  recordedAt: string; // ISO timestamp
+  recordedByName: string;
+}
+
+/**
  * 31. progress Collection (Document ID: {studentId}_{taskId})
- * 注意: historicalGrade はタスクが属する歴史的学年（M1→M2進級時もM1のhistoricalGradeはM1のまま保持）
  */
 export interface ProgressRecord {
   progressId: string; // `${studentId}_${taskId}`
@@ -144,6 +183,22 @@ export interface ProgressRecord {
   comment: string;
   updatedAt: string; // ISO timestamp
   updatedByUid: string;
+}
+
+/**
+ * ②・④ 来年度の管理体制および研究室運用ルール設定
+ */
+export interface LabOperationConfig {
+  academicYear: number;
+  primaryAdminName: string; // 主管理者（教員または全体管理者）
+  studentAdminNames: string; // 学生管理担当（例：菊水・立山）
+  scheduleManagerName: string; // 年間スケジュール・カレンダー登録担当
+  taskManagerName: string; // タスク更新・情報修正担当
+  updateTimingRule: string; // 学生が進捗を更新するタイミング（例：毎週のゼミ前日までに更新）
+  reviewMethodRule: string; // 研究室全体での進捗確認方法（例：週次ゼミ冒頭で「研究室メンバーの進捗」画面を共有）
+  googleCalendarId: string; // 連携先GoogleカレンダーID (例: nittai.daigakuin@gmail.com)
+  gasBridgeWebhookUrl: string; // メール送信＆Googleカレンダー双方向同期用GAS WebアプリURL
+  updatedAt: string;
 }
 
 /**
@@ -187,7 +242,10 @@ export type AuditAction =
   | 'RESET_PASSWORD'
   | 'UPDATE_ACADEMIC_YEAR'
   | 'UPDATE_ROADMAP'
-  | 'ADMIN_UPDATE_PROGRESS';
+  | 'ADMIN_UPDATE_PROGRESS'
+  | 'SEND_REMINDER_EMAIL'
+  | 'SYNC_GOOGLE_CALENDAR'
+  | 'UPDATE_OPERATION_CONFIG';
 
 export interface AuditLog {
   auditId: string;

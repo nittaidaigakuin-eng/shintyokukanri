@@ -20,6 +20,7 @@ import {
   determineCalendarSyncAction,
   evaluateDeadlineState,
   getPreviousMonday,
+  mergeBidirectionalCalendarEvents,
   promoteStudentToM2,
   resolveAppliedDueDate,
   shouldSendNotification,
@@ -251,5 +252,53 @@ describe('Notification & Calendar Deduplication (#60, #67, #68)', () => {
     expect(
       determineCalendarSyncAction({ calendarDisplay: false, date: null }, null)
     ).toBe('NOOP');
+  });
+
+  it('merges bidirectional Google Calendar events (Google -> Web new import & update)', () => {
+    const localEvents = [
+      {
+        eventKey: 'M2_MIDTERM_PRESENTATION',
+        name: 'M2中間発表日',
+        eventCategory: 'OFFICIAL' as const,
+        target: 'M2' as const,
+        date: '2026-07-18',
+        time: '09:00',
+        reminderDays: [14, 7, 3, 0],
+        calendarDisplay: true,
+        notes: '初期メモ',
+        googleCalendarEventId: 'gcal-100',
+        updatedAt: '2026-04-01T00:00:00.000Z',
+      },
+    ];
+    const remoteEvents = [
+      {
+        googleCalendarEventId: 'gcal-100',
+        eventKey: 'M2_MIDTERM_PRESENTATION',
+        title: 'M2中間発表日（変更後）',
+        date: '2026-07-25',
+        time: '13:00',
+        category: 'OFFICIAL' as const,
+        notes: 'Googleカレンダー側で日程変更',
+        updatedAt: '2026-05-01T00:00:00.000Z',
+      },
+      {
+        googleCalendarEventId: 'gcal-200',
+        title: '【授業】後期合同ゼミ',
+        date: '2026-10-05',
+        time: '10:00',
+        category: 'CLASS' as const,
+        notes: '全員出席',
+        updatedAt: '2026-05-02T00:00:00.000Z',
+      },
+    ];
+
+    const res = mergeBidirectionalCalendarEvents(localEvents, remoteEvents);
+
+    expect(res.updatedFromGoogleCount).toBe(1);
+    expect(res.importedCount).toBe(1);
+    expect(res.mergedEvents).toHaveLength(2);
+    expect(res.mergedEvents[0].date).toBe('2026-07-25');
+    expect(res.mergedEvents[1].eventCategory).toBe('CLASS');
+    expect(res.mergedEvents[1].syncOrigin).toBe('GOOGLE_CALENDAR');
   });
 });

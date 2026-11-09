@@ -59,9 +59,9 @@ service cloud.firestore {
     // 2. students/{studentId}
     // =========================================================================
     match /students/{studentId} {
-      // 学生本人は自分の studentId のみ読み取り可能。他学生のデータは一切読めない
-      allow read: if isAdmin() || isOwnStudentId(studentId);
-      // 作成・更新・削除は管理者のみ（通常は Cloud Functions 経由）
+      // 研究室内の情報共有のため、認証済みの学生および管理者は所属学生一覧を閲覧可能（更新は管理者のみ）
+      allow read: if isAdmin() || isStudent();
+      // 作成・更新・削除は管理者のみ
       allow create, update, delete: if isAdmin();
     }
 
@@ -92,10 +92,9 @@ service cloud.firestore {
     // 5. progress/{progressId}
     // =========================================================================
     match /progress/{progressId} {
-      // 学生は自分の studentId に紐づく進捗のみ読み取り可能
-      allow read: if isAdmin() || (
-        isStudent() && isOwnStudentId(resource.data.studentId)
-      );
+      // 研究室内での進捗状況共有のため、認証済みの学生・管理者は全学生の進捗を閲覧可能（Read-Only共有）
+      // ただし更新（書き込み）は引き続き「自分自身の studentId に紐づくデータのみ」に厳格制限する
+      allow read: if isAdmin() || isStudent();
 
       // 学生による更新：自分の進捗であり、かつ不変フィールド（studentId, taskId, historicalGrade, commonDueDate等）を変更していないこと
       allow update: if isAdmin() || (

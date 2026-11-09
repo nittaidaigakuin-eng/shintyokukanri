@@ -395,3 +395,102 @@ export function determineCalendarSyncAction(
     return existingCalendarEventId ? 'DELETE' : 'NOOP';
   }
 }
+
+/**
+ * ③ Googleカレンダーとの双方向同期（Webアプリ ⇄ Google Calendar）マージロジック
+ * - Webアプリで登録・更新された予定は Google Calendar 側へ送信 (outbound)
+ * - Google Calendar 側で新規追加・変更された予定（授業・研究室行事・公式日程）は Webアプリ側へ反映 (inbound)
+ * - 双方で同じイベントが更新された場合は updatedAt が新しい方を採用する
+ */
+export interface ExternalGoogleCalendarEvent {
+  googleCalendarEventId: string;
+  eventKey?: string | null;
+  title: string;
+  date: string; // YYYY-MM-DD
+  time?: string | null; // HH:mm
+  category?: 'OFFICIAL' | 'CLASS' | 'LAB_EVENT';
+  notes?: string;
+  updatedAt: string; // ISO
+}
+
+export function mergeBidirectionalCalendarEvents(
+  localEvents: AcademicEvent[],
+  remoteCalendarEvents: ExternalGoogleCalendarEvent[]
+): {
+  mergedEvents: AcademicEvent[];
+  importedCount: number;
+  updatedFromGoogleCount: number;
+} {
+  const mergedMap = new Map<string, AcademicEvent>();
+  for (const ev of localEvents) {
+    mergedMap.set(ev.eventKey, { ...ev });
+  }
+
+  let importedCount = 0;
+  let updatedFromGoogleCount = 0;
+
+  for (const remote of remoteCalendarEvents) {
+    if (!isValidDateString(remote.date)) continue;
+
+    // 既存イベントを eventKey または googleCalendarEventId で検索
+    let matchedKey: string | null = null;
+    if (remote.eventKey && mergedMap.has(remote.eventKey)) {
+      matchedKey = remote.eventKey;
+    } else {
+      for (const [k, v] of mergedMap.entries()) {
+        if (
+          v.googleCalendarEventId &&
+          v.googleCalendarEventId === remote.googleCalendarEventId
+        ) {
+          matchedKey = k;
+          break;
+        }
+      }
+    }
+
+    if (matchedKey) {
+      const existing = mergedMap.get(matchedKey)!;
+      const localUpdated = existing.updatedAt ?? '1970-01-01T00:00:00.000Z';
+      if (remote.updatedAt > localUpdated) {
+        mergedMap.set(matchedKey, {
+          ...existing,
+          name: remote.title || existing.name,
+          date: remote.date,
+          time: remote.time ?? existing.time,
+          notes: remote.notes ?? existing.notes,
+          googleCalendarEventId: remote.googleCalendarEventId,
+          syncOrigin: 'GOOGLE_CALENDAR',
+          updatedAt: remote.updatedAt,
+        });
+        updatedFromGoogleCount++;
+      }
+    } else {
+      const newKey =
+        remote.eventKey || `GCAL_${remote.googleCalendarEventId}`;
+      mergedMap.set(newKey, {
+        eventKey: newKey,
+        name: remote.title,
+        eventCategory: remote.category ?? 'LAB_EVENT',
+        target: 'ALL',
+        date: remote.date,
+        time: remote.time ?? null,
+        reminderDays: [7, 3, 0],
+        calendarDisplay: true,
+        notes: remote.notes ?? 'Googleカレンダーから取込',
+        googleCalendarEventId: remote.googleCalendarEventId,
+        syncOrigin: 'GOOGLE_CALENDAR',
+        updatedAt: remote.updatedAt,
+      });
+      importedCount++;
+    }
+  }
+
+  return {
+    mergedEvents: Array.from(mergedMap.values()).sort((a, b) =>
+      (a.date ?? '9999-99-99').localeCompare(b.date ?? '9999-99-99')
+    ),
+    importedCount,
+    updatedFromGoogleCount,
+  };
+}
+
